@@ -11,6 +11,7 @@ celestial sphere that turns with sidereal time.
 
 It is built for Omarchy Quattro. Change themes and the sky retints itself.
 Choose another background and `skybg` bows out after confirming the change.
+It also runs on macOS, where it follows the system light/dark appearance.
 
 | Sunrise | Clear night |
 | --- | --- |
@@ -18,10 +19,11 @@ Choose another background and `skybg` bows out after confirming the change.
 
 ## Requirements
 
-- Omarchy Quattro
 - Python 3.11 or newer
 - ImageMagick (`magick` and `montage`)
-- systemd user services
+- On Omarchy: Omarchy Quattro and systemd user services
+- On macOS: nothing extra — the installer sets up a launchd agent, and macOS
+  will ask once to allow your terminal to control "System Events"
 - Optional: [linecast](https://github.com/ashuttl/linecast) for automatic location
 - Optional: network access for Open-Meteo cloud and fog data
 
@@ -90,6 +92,16 @@ Solar position and stars are calculated locally.
 `theme-set` hook rerenders while its timer is active, so every theme supplies
 its own palette. The current background alternates between two generated files
 because Quattro watches the background symlink target.
+
+## macOS integration
+
+On macOS, the timer is a launchd agent (`com.skybg.tick`, every five minutes),
+the display size comes from `system_profiler`, and the wallpaper is set
+through System Events — which covers every display in the current Space.
+Without an Omarchy theme, colors come from a built-in palette that follows the
+system light/dark appearance and retints within one tick of a switch. To use
+your own palette instead, drop an Omarchy-style `colors.toml` at
+`${XDG_CONFIG_HOME:-~/.config}/skybg/colors.toml`.
 
 ## Updating and removing
 

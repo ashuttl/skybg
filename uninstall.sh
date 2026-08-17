@@ -9,17 +9,27 @@ fi
 BIN=${HOME}/.local/bin/skybg
 UNIT_DIR=${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user
 HOOK=${HOME}/.config/omarchy/hooks/theme-set.d/skybg-retint
+PLIST=${HOME}/Library/LaunchAgents/com.skybg.tick.plist
 CONFIG_DIR=${XDG_CONFIG_HOME:-${HOME}/.config}/skybg
 STATE_DIR=${XDG_STATE_HOME:-${HOME}/.local/state}/skybg
 
-systemctl --user disable --now skybg.timer 2>/dev/null || true
-for path in "$BIN" "$UNIT_DIR/skybg.service" "$UNIT_DIR/skybg.timer" "$HOOK"; do
+if [[ $(uname -s) == Darwin ]]; then
+  launchctl bootout "gui/$(id -u)/com.skybg.tick" 2>/dev/null || true
+  paths=("$BIN" "$PLIST")
+else
+  systemctl --user disable --now skybg.timer 2>/dev/null || true
+  paths=("$BIN" "$UNIT_DIR/skybg.service" "$UNIT_DIR/skybg.timer" "$HOOK")
+fi
+
+for path in "${paths[@]}"; do
   if [[ -e $path || -L $path ]]; then
     rm -- "$path"
     echo "Removed $path"
   fi
 done
-systemctl --user daemon-reload
+if [[ $(uname -s) != Darwin ]]; then
+  systemctl --user daemon-reload
+fi
 
 if [[ ${1:-} == "--purge" ]]; then
   rm -rf -- "$CONFIG_DIR" "$STATE_DIR"

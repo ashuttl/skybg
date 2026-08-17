@@ -42,11 +42,15 @@ import time
 import urllib.request
 
 HOME = os.path.expanduser("~")
+IS_MAC = sys.platform == "darwin"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "skybg")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+USER_COLORS_TOML = os.path.join(CONFIG_DIR, "colors.toml")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "skybg")
 COLORS_TOML = os.path.join(HOME, ".local/state/omarchy/current/theme/colors.toml")
 BACKGROUND_LINK = os.path.join(HOME, ".local/state/omarchy/current/background")
+LAUNCH_AGENT_LABEL = "com.skybg.tick"
+LAUNCH_AGENT_PLIST = os.path.join(HOME, "Library/LaunchAgents", LAUNCH_AGENT_LABEL + ".plist")
 LOCATION_CACHE = os.path.join(STATE_DIR, "location")
 WEATHER_CACHE = os.path.join(STATE_DIR, "weather.json")
 FOREIGN_MARKER = os.path.join(STATE_DIR, "foreign-seen")
@@ -89,7 +93,10 @@ def render_lock():
 
 
 def which(name):
-    extra = os.pathsep.join([os.path.join(HOME, ".local/bin"), "/usr/bin", "/usr/local/bin"])
+    # launchd and systemd timers run with a minimal PATH; look in the usual
+    # install prefixes too.
+    extra = os.pathsep.join([os.path.join(HOME, ".local/bin"), "/usr/bin", "/usr/local/bin",
+                             "/opt/homebrew/bin"])
     return shutil.which(name, path=os.environ.get("PATH", "") + os.pathsep + extra) or name
 
 
@@ -229,15 +236,42 @@ HUE_DEFAULTS = {"red": "#b05f58", "green": "#6f9a76", "yellow": "#c4a76a",
                 "blue": "#6d8fb4", "cyan": "#6fa7a0", "magenta": "#9a7fa8"}
 
 
+BASE_DEFAULTS = {"dark": {"background": "#20242b", "foreground": "#d0d5da"},
+                 "light": {"background": "#dde3ea", "foreground": "#343b44"}}
+
+
+def macos_dark_mode():
+    out = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                         capture_output=True, text=True, timeout=10).stdout
+    return out.strip() == "Dark"
+
+
+def theme_source():
+    """(kind, detail) describing where colors come from: an Omarchy theme, a
+    user colors.toml, or (macOS only) built-in defaults per appearance."""
+    if os.path.isfile(COLORS_TOML):
+        return "omarchy", COLORS_TOML
+    if os.path.isfile(USER_COLORS_TOML):
+        return "file", USER_COLORS_TOML
+    if IS_MAC:
+        return "builtin", "dark" if macos_dark_mode() else "light"
+    return None, None
+
+
 def theme_colors():
     """Parse the current theme's colors.toml, normalized so every key skybg
-    uses exists — older/minimal themes may only define color0-15 ANSI slots."""
-    import tomllib
-    try:
-        with open(COLORS_TOML, "rb") as f:
+    uses exists — older/minimal themes may only define color0-15 ANSI slots.
+    On macOS without a colors.toml, fall back to a built-in palette matched
+    to the system light/dark appearance."""
+    kind, detail = theme_source()
+    if kind is None:
+        raise SkybgError("no active Omarchy theme found")
+    if kind == "builtin":
+        raw = dict(BASE_DEFAULTS[detail])
+    else:
+        import tomllib
+        with open(detail, "rb") as f:
             raw = tomllib.load(f)
-    except FileNotFoundError as exc:
-        raise SkybgError("no active Omarchy theme found") from exc
     c = {k: hexrgb(v) for k, v in raw.items() if isinstance(v, str) and v.startswith("#")}
 
     c.setdefault("background", hexrgb("#20242b"))
@@ -419,6 +453,21 @@ def star_mvg(width, height, elev, cloud, c, t_utc, lat, lon):
 # ---------- rendering ----------
 
 def screen_size():
+    if IS_MAC:
+        try:
+            out = subprocess.run(["system_profiler", "SPDisplaysDataType", "-json"],
+                                 capture_output=True, text=True, timeout=30).stdout
+            sizes = []
+            for gpu in json.loads(out)["SPDisplaysDataType"]:
+                for display in gpu.get("spdisplays_ndrvs", []):
+                    m = re.match(r"(\d+)\s*x\s*(\d+)", display.get("_spdisplays_pixels", ""))
+                    if m:
+                        sizes.append((int(m.group(1)), int(m.group(2))))
+            if sizes:
+                return max(sizes, key=lambda s: s[0] * s[1])
+        except Exception:
+            pass
+        return 2560, 1600
     try:
         out = subprocess.run([which("hyprctl"), "monitors", "-j"],
                              capture_output=True, text=True, timeout=10).stdout
@@ -458,21 +507,58 @@ def render_sky(out_path, width, height, t_utc, lat, lon, cloud, fog, colors):
     return elev, az
 
 
+def current_background():
+    """Real path of the current background, or "" when unknown."""
+    if IS_MAC:
+        try:
+            out = subprocess.run(
+                [which("osascript"), "-e",
+                 'tell application "System Events" to get picture of first desktop'],
+                capture_output=True, text=True, timeout=15).stdout.strip()
+            return os.path.realpath(out) if out else ""
+        except Exception:
+            return ""
+    return os.path.realpath(BACKGROUND_LINK) if os.path.islink(BACKGROUND_LINK) else ""
+
+
+def set_background(path):
+    if IS_MAC:
+        subprocess.run(
+            [which("osascript"), "-e",
+             f'tell application "System Events" to set picture of every desktop to "{path}"'],
+            check=True, timeout=30)
+    else:
+        subprocess.run([which("omarchy"), "theme", "bg", "set", path], check=True, timeout=30)
+
+
 def generate_and_set():
     with render_lock():
         lat, lon = get_location()
         cloud, fog = get_weather(lat, lon)
         width, height = screen_size()
 
-        # Alternate names so Quattro's background watcher sees a new target.
-        current = os.path.realpath(BACKGROUND_LINK) if os.path.islink(BACKGROUND_LINK) else ""
-        out_path = os.path.join(STATE_DIR, "sky-b.png" if current.endswith("sky-a.png") else "sky-a.png")
+        # Alternate names so background watchers (Quattro's, or macOS's
+        # path-keyed wallpaper cache) see a new target.
+        out_path = os.path.join(
+            STATE_DIR, "sky-b.png" if current_background().endswith("sky-a.png") else "sky-a.png")
 
         elev, az = render_sky(out_path, width, height,
                               datetime.datetime.now(datetime.timezone.utc),
                               lat, lon, cloud, fog, theme_colors())
-        subprocess.run([which("omarchy"), "theme", "bg", "set", out_path], check=True, timeout=30)
+        set_background(out_path)
     return elev, cloud, fog
+
+
+def montage_font():
+    """Homebrew ImageMagick ships without a default font; hand it a system one."""
+    if not IS_MAC:
+        return []
+    for path in ("/System/Library/Fonts/Supplemental/Arial.ttf",
+                 "/System/Library/Fonts/Helvetica.ttc",
+                 "/System/Library/Fonts/SFNS.ttf"):
+        if os.path.isfile(path):
+            return ["-font", path]
+    return []
 
 
 def render_preview(cloud_override=None):
@@ -495,7 +581,7 @@ def render_preview(cloud_override=None):
     out = os.path.join(HOME, "Pictures/skybg-day-preview.png")
     temporary = out + ".tmp.png"
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    subprocess.run([which("montage")] + panels + [
+    subprocess.run([which("montage")] + panels + montage_font() + [
         "-tile", "8x3", "-geometry", "+3+3", "-background", "#111",
         "-fill", "#ccc", "-pointsize", "13", temporary], check=True)
     os.replace(temporary, out)
@@ -505,16 +591,49 @@ def render_preview(cloud_override=None):
 
 
 def owns_background():
-    if not os.path.islink(BACKGROUND_LINK):
-        return False
-    return os.path.realpath(BACKGROUND_LINK).startswith(os.path.realpath(STATE_DIR))
+    current = current_background()
+    return bool(current) and current.startswith(os.path.realpath(STATE_DIR) + os.sep)
+
+
+def gui_domain():
+    return f"gui/{os.getuid()}"
 
 
 def timer_active():
+    if IS_MAC:
+        return subprocess.run(
+            ["launchctl", "print", f"{gui_domain()}/{LAUNCH_AGENT_LABEL}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
     return subprocess.run(
         ["systemctl", "--user", "is-active", "--quiet", "skybg.timer"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     ).returncode == 0
+
+
+def timer_enable():
+    if IS_MAC:
+        if not os.path.isfile(LAUNCH_AGENT_PLIST):
+            raise SkybgError(f"{LAUNCH_AGENT_PLIST} is not installed; run ./install.sh")
+        service = f"{gui_domain()}/{LAUNCH_AGENT_LABEL}"
+        subprocess.run(["launchctl", "enable", service], check=True)
+        subprocess.run(["launchctl", "bootout", service],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["launchctl", "bootstrap", gui_domain(), LAUNCH_AGENT_PLIST], check=True)
+    else:
+        subprocess.run(["systemctl", "--user", "enable", "--now", "skybg.timer"], check=True)
+
+
+def timer_disable():
+    if IS_MAC:
+        # Disable before bootout: launch agents auto-load at login, and when
+        # `skybg tick` disables its own agent, bootout terminates this process.
+        service = f"{gui_domain()}/{LAUNCH_AGENT_LABEL}"
+        subprocess.run(["launchctl", "disable", service])
+        subprocess.run(["launchctl", "bootout", service],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "skybg.timer"])
 
 
 # ---------- commands ----------
@@ -553,23 +672,38 @@ def configure(args):
 
 def doctor():
     checks = []
-    for command in ("omarchy", "magick", "montage", "systemctl"):
-        checks.append((command, shutil.which(command) is not None, "required command"))
-    checks.append(("Omarchy theme", os.path.isfile(COLORS_TOML), COLORS_TOML))
-    checks.append(("Hyprland session", bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")),
-                   "monitor size falls back to 2560x1600 when unavailable"))
+    advisory = set()
+    commands = ("magick", "montage") if IS_MAC else ("omarchy", "magick", "montage", "systemctl")
+    for command in commands:
+        checks.append((command, which(command) != command, "required command"))
+    if IS_MAC:
+        okay = sys.version_info >= (3, 11)
+        checks.append(("Python 3.11+", okay, f"running {sys.version.split()[0]}"))
+        kind, detail = theme_source()
+        sources = {"omarchy": f"Omarchy theme at {detail}",
+                   "file": f"user palette at {detail}",
+                   "builtin": f"built-in {detail} palette (system appearance)"}
+        checks.append(("theme colors", True, sources[kind]))
+        checks.append((LAUNCH_AGENT_LABEL, os.path.isfile(LAUNCH_AGENT_PLIST),
+                       "installed launch agent"))
+    else:
+        checks.append(("Omarchy theme", os.path.isfile(COLORS_TOML), COLORS_TOML))
+        checks.append(("Hyprland session", bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")),
+                       "monitor size falls back to 2560x1600 when unavailable"))
+        advisory.add("Hyprland session")
+        unit_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+                                "systemd/user")
+        for unit in ("skybg.service", "skybg.timer"):
+            checks.append((unit, os.path.isfile(os.path.join(unit_dir, unit)),
+                           "installed user unit"))
     try:
         lat, lon = get_location()
         checks.append(("location", True, f"{lat:.4f}, {lon:.4f}"))
     except SkybgError as exc:
         checks.append(("location", False, str(exc)))
-    unit_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
-                            "systemd/user")
-    for unit in ("skybg.service", "skybg.timer"):
-        checks.append((unit, os.path.isfile(os.path.join(unit_dir, unit)), "installed user unit"))
     for name, okay, detail in checks:
         print(f"{'ok' if okay else 'FAIL':4}  {name}: {detail}")
-    return all(okay for name, okay, detail in checks if name != "Hyprland session")
+    return all(okay for name, okay, detail in checks if name not in advisory)
 
 
 def parser():
@@ -597,13 +731,13 @@ def run(args):
         if os.path.exists(FOREIGN_MARKER):
             os.remove(FOREIGN_MARKER)
         elev, cloud, fog = generate_and_set()
-        subprocess.run(["systemctl", "--user", "enable", "--now", "skybg.timer"], check=True)
+        timer_enable()
         print(f"skybg on — sun at {elev:+.1f}° ({phase_name(elev)}), "
               f"{weather_words(cloud, fog)}, refreshing every 5 minutes")
     elif cmd == "off":
         if os.path.exists(FOREIGN_MARKER):
             os.remove(FOREIGN_MARKER)
-        subprocess.run(["systemctl", "--user", "disable", "--now", "skybg.timer"])
+        timer_disable()
         print("skybg off — background left as-is")
     elif cmd == "once":
         elev, cloud, fog = generate_and_set()
@@ -617,7 +751,7 @@ def run(args):
             # Foreign background two ticks in a row: the user really did switch
             # away (e.g. cycled to a photo). Bow out gracefully.
             os.remove(FOREIGN_MARKER)
-            subprocess.run(["systemctl", "--user", "disable", "--now", "skybg.timer"])
+            timer_disable()
         else:
             # First foreign sighting may just be a theme-change transition
             # racing this tick (the theme-set hook re-owns shortly after).

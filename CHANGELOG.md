@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Run on macOS: launchd timer, wallpaper via System Events, display size via
+  `system_profiler`, and a built-in palette that follows the system light/dark
+  appearance (override with `~/.config/skybg/colors.toml`).
+
 ## 0.1.0 — 2026-08-16
 
 - Follow solar elevation and azimuth with theme-derived sky gradients.
