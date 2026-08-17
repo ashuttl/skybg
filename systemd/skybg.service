@@ -1,0 +1,6 @@
+[Unit]
+Description=skybg sky-gradient background refresh
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/skybg tick

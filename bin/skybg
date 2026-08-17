@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""skybg — sky-gradient backgrounds that track the sun, the weather, and the current Omarchy theme.
+
+Samples the current theme's colors.toml, the sun's position (elevation AND
+azimuth; location via `linecast location`), and current cloud cover / fog
+(Open-Meteo) to render a sky gradient, in the spirit of linecast sunshine.
+Theme-independent: switch themes and the sky re-tints.
+
+- A soft glow tracks the sun across the screen (east-left in the morning,
+  west-right in the afternoon), strongest around sunrise/sunset.
+- Cloud cover grays and flattens the sky; fog all the more so.
+- On clear nights, a sprinkling of subtle stars follows the celestial sphere,
+  rising in the east and setting in the west as sidereal time advances.
+
+Commands:
+  skybg on             generate + set the background, and start the 5-minute timer
+  skybg off            stop the timer (background stays until you change it)
+  skybg once           generate + set once, without touching the timer
+  skybg tick           timer entry point: refresh if skybg still owns the background;
+                       after two ticks of a foreign background, stop the timer
+  skybg status         show location, sun position, weather, phase, timer state
+  skybg doctor         check dependencies, location, theme, and installed units
+  skybg preview [N]    render a 24-hour montage to ~/Pictures/skybg-day-preview.png,
+                       at N% cloud cover (default: live weather)
+  skybg config ...     set location and weather behavior
+"""
+
+import datetime
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "skybg")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "skybg")
+COLORS_TOML = os.path.join(HOME, ".local/state/omarchy/current/theme/colors.toml")
+BACKGROUND_LINK = os.path.join(HOME, ".local/state/omarchy/current/background")
+LOCATION_CACHE = os.path.join(STATE_DIR, "location")
+WEATHER_CACHE = os.path.join(STATE_DIR, "weather.json")
+FOREIGN_MARKER = os.path.join(STATE_DIR, "foreign-seen")
+WEATHER_TTL = 1200  # seconds
+FOG_CODES = {45, 48}
+
+
+class SkybgError(Exception):
+    """An expected, actionable skybg failure."""
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"location": "auto", "weather": True}
+    except (OSError, ValueError) as exc:
+        raise SkybgError(f"could not read {CONFIG_FILE}: {exc}") from exc
+    data.setdefault("location", "auto")
+    data.setdefault("weather", True)
+    return data
+
+
+def save_config(config):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    temporary = CONFIG_FILE + ".tmp"
+    with open(temporary, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    os.replace(temporary, CONFIG_FILE)
+
+
+@contextlib.contextmanager
+def render_lock():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "render.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def which(name):
+    extra = os.pathsep.join([os.path.join(HOME, ".local/bin"), "/usr/bin", "/usr/local/bin"])
+    return shutil.which(name, path=os.environ.get("PATH", "") + os.pathsep + extra) or name
+
+
+def clamp(v, lo=0.0, hi=1.0):
+    return max(lo, min(hi, v))
+
+
+def smoothstep(lo, hi, v):
+    t = clamp((v - lo) / (hi - lo))
+    return t * t * (3 - 2 * t)
+
+
+# ---------- location ----------
+
+def get_location():
+    configured = load_config()["location"]
+    if configured != "auto":
+        try:
+            lat, lon = map(float, configured)
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ValueError
+            return lat, lon
+        except (TypeError, ValueError):
+            raise SkybgError(f"invalid location in {CONFIG_FILE}; run 'skybg config location auto'")
+    try:
+        out = subprocess.run(
+            [which("linecast"), "location"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        m = re.search(r"\((-?\d+\.?\d*),\s*(-?\d+\.?\d*)\)", out)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(LOCATION_CACHE, "w") as f:
+                f.write(f"{lat} {lon}\n")
+            return lat, lon
+    except Exception:
+        pass
+    try:
+        with open(LOCATION_CACHE) as f:
+            lat, lon = f.read().split()
+            return float(lat), float(lon)
+    except Exception:
+        raise SkybgError(
+            "no location available; install/configure linecast or run "
+            "'skybg config location LAT LON'"
+        )
+
+
+# ---------- weather ----------
+
+def get_weather(lat, lon):
+    """Returns (cloud_fraction 0..1, is_fog). Cached; degrades to last-known, then 0.3."""
+    if not load_config()["weather"]:
+        return 0.0, False
+    try:
+        with open(WEATHER_CACHE) as f:
+            cached = json.load(f)
+        if time.time() - cached["ts"] < WEATHER_TTL:
+            return cached["cloud"], cached["fog"]
+    except Exception:
+        cached = None
+
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+           "&current=cloud_cover,weather_code")
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            current = json.load(resp)["current"]
+        cloud = clamp(current["cloud_cover"] / 100)
+        fog = current["weather_code"] in FOG_CODES
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(WEATHER_CACHE, "w") as f:
+            json.dump({"ts": time.time(), "cloud": cloud, "fog": fog}, f)
+        return cloud, fog
+    except Exception:
+        if cached:
+            return cached["cloud"], cached["fog"]
+        return 0.3, False
+
+
+# ---------- sun ----------
+
+def solar_position(lat, lon, t_utc):
+    """(elevation, azimuth-from-north) in degrees. NOAA approximation."""
+    frac_hour = t_utc.hour + t_utc.minute / 60 + t_utc.second / 3600
+    gamma = 2 * math.pi / 365 * (t_utc.timetuple().tm_yday - 1 + (frac_hour - 12) / 24)
+    decl = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+            - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma)
+            - 0.002697 * math.cos(3 * gamma) + 0.00148 * math.sin(3 * gamma))
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
+                       - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma))
+    ha = math.radians((frac_hour * 60 + eqtime + 4 * lon) / 4 - 180)
+    lat_r = math.radians(lat)
+    cos_zen = (math.sin(lat_r) * math.sin(decl)
+               + math.cos(lat_r) * math.cos(decl) * math.cos(ha))
+    elev = math.degrees(math.asin(clamp(cos_zen, -1.0, 1.0)))
+    az = math.degrees(math.atan2(
+        math.sin(ha),
+        math.cos(ha) * math.sin(lat_r) - math.tan(decl) * math.cos(lat_r)))
+    return elev, (az + 180) % 360
+
+
+PHASES = [(-90, "night"), (-12, "astronomical twilight"), (-6, "nautical twilight"),
+          (-4, "civil twilight"), (0.5, "golden hour"), (8, "day")]
+
+
+def phase_name(elev):
+    name = PHASES[0][1]
+    for threshold, n in PHASES:
+        if elev >= threshold:
+            name = n
+    return name
+
+
+# ---------- colors ----------
+
+def hexrgb(s):
+    s = s.lstrip("#")
+    return tuple(int(s[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def lerp(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def lighten(c, t):
+    return lerp(c, (1.0, 1.0, 1.0), t)
+
+
+def gray_of(c):
+    y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    return (y, y, y)
+
+
+ANSI_SLOTS = {"red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5, "cyan": 6}
+HUE_DEFAULTS = {"red": "#b05f58", "green": "#6f9a76", "yellow": "#c4a76a",
+                "blue": "#6d8fb4", "cyan": "#6fa7a0", "magenta": "#9a7fa8"}
+
+
+def theme_colors():
+    """Parse the current theme's colors.toml, normalized so every key skybg
+    uses exists — older/minimal themes may only define color0-15 ANSI slots."""
+    import tomllib
+    try:
+        with open(COLORS_TOML, "rb") as f:
+            raw = tomllib.load(f)
+    except FileNotFoundError as exc:
+        raise SkybgError("no active Omarchy theme found") from exc
+    c = {k: hexrgb(v) for k, v in raw.items() if isinstance(v, str) and v.startswith("#")}
+
+    c.setdefault("background", hexrgb("#20242b"))
+    c.setdefault("foreground", hexrgb("#d0d5da"))
+    for name, slot in ANSI_SLOTS.items():
+        if name not in c and f"color{slot}" in c:
+            c[name] = c[f"color{slot}"]
+        if f"bright_{name}" not in c:
+            if f"color{slot + 8}" in c:
+                c[f"bright_{name}"] = c[f"color{slot + 8}"]
+            elif name in c:
+                c[f"bright_{name}"] = lighten(c[name], 0.2)
+    for name, fallback in HUE_DEFAULTS.items():
+        c.setdefault(name, hexrgb(fallback))
+    c.setdefault("orange", lerp(c["red"], c["yellow"], 0.5))
+    c.setdefault("dark_background", lerp(c["background"], (0, 0, 0), 0.2))
+    c.setdefault("darker_background", lerp(c["background"], (0, 0, 0), 0.35))
+    c.setdefault("lighter_background", lighten(c["background"], 0.10))
+    c.setdefault("bright_foreground", lighten(c["foreground"], 0.2))
+    return c
+
+
+def sky_stops(elev, c):
+    """(zenith, mid, horizon) colors for a sun elevation, blended from theme colors."""
+    bg = c["background"]
+    dbg = c.get("darker_background", bg)
+    lbg = c.get("lighter_background", bg)
+    blue, cyan = c["blue"], c["cyan"]
+    mag, orange, red, yellow = c["magenta"], c["orange"], c["red"], c["yellow"]
+
+    dusk_h = lerp(red, mag, 0.5)
+    keyframes = [
+        (-18, (dbg, lerp(dbg, bg, 0.5), bg)),
+        (-9, (dbg, lerp(dbg, bg, 0.8), lerp(bg, blue, 0.20))),
+        (-4, (lerp(dbg, blue, 0.10), lerp(bg, mag, 0.25), lerp(bg, dusk_h, 0.45))),
+        (0, (lerp(bg, blue, 0.25), lerp(bg, mag, 0.40), lerp(bg, orange, 0.70))),
+        (4, (lerp(bg, blue, 0.40), lerp(lbg, cyan, 0.25), lerp(lbg, yellow, 0.45))),
+        (12, (lerp(bg, blue, 0.50), lerp(lbg, blue, 0.35), lerp(lbg, cyan, 0.40))),
+        (50, (lighten(lerp(bg, blue, 0.55), 0.06), lerp(lbg, blue, 0.45),
+              lighten(lerp(lbg, cyan, 0.45), 0.05))),
+    ]
+
+    if elev <= keyframes[0][0]:
+        return keyframes[0][1]
+    if elev >= keyframes[-1][0]:
+        return keyframes[-1][1]
+    for (e0, s0), (e1, s1) in zip(keyframes, keyframes[1:]):
+        if e0 <= elev <= e1:
+            t = smoothstep(e0, e1, elev)
+            return tuple(lerp(s0[i], s1[i], t) for i in range(3))
+
+
+# ---------- sky field ----------
+
+GRID_W, GRID_H = 64, 40
+
+
+def sky_field(c, elev, az, cloud, fog):
+    """Small 2D pixel grid: vertical gradient + sun glow + weather graying."""
+    if fog:
+        cloud = max(cloud, 0.85)
+    zenith, mid, horizon = sky_stops(elev, c)
+
+    # Overcast flattens the sky: horizon pulls toward mid, contrast shrinks.
+    horizon = lerp(horizon, mid, 0.35 * cloud)
+    zenith = lerp(zenith, mid, 0.15 * cloud)
+
+    # Afternoon runs slightly warmer than morning.
+    warm = 0.10 * smoothstep(180, 250, az) * smoothstep(4, 15, elev)
+    if warm > 0:
+        mid = lerp(mid, c["yellow"], warm * 0.5)
+        horizon = lerp(horizon, c["orange"], warm)
+
+    # Sun screen position: azimuth east->left, west->right; low sun sits low.
+    sun_x = clamp(0.15 + 0.7 * (az - 90) / 180, 0.06, 0.94)
+    sun_y = 1.05 - 0.9 * clamp((elev + 6) / 66)
+    sigma = 0.33 + 0.15 * clamp(elev / 60)
+    glow_strength = (0.5 * math.exp(-((elev - 1) / 11) ** 2)
+                     + 0.14 * smoothstep(10, 30, elev))
+    glow_strength *= (1 - 0.85 * cloud)
+    if elev < -7:
+        glow_strength = 0.0
+    glow_color = lerp(c["orange"], lighten(c["yellow"], 0.25), clamp(elev / 20))
+
+    gray_w = 0.55 * cloud
+    dim = 1 - 0.07 * cloud * smoothstep(0, 8, elev)
+
+    pixels = []
+    for gy in range(GRID_H):
+        p = gy / (GRID_H - 1)
+        if p <= 0.58:
+            base = lerp(zenith, mid, (1 - math.cos(p / 0.58 * math.pi)) / 2)
+        else:
+            base = lerp(mid, horizon, (1 - math.cos((p - 0.58) / 0.42 * math.pi)) / 2)
+        row = []
+        for gx in range(GRID_W):
+            x = gx / (GRID_W - 1)
+            color = base
+            if glow_strength > 0:
+                d2 = ((x - sun_x) / (sigma * 1.7)) ** 2 + ((p - sun_y) / sigma) ** 2
+                g = glow_strength * math.exp(-d2)
+                if g > 0.003:
+                    color = lerp(color, glow_color, clamp(g, 0, 0.55))
+            if gray_w > 0:
+                color = lerp(color, gray_of(color), gray_w)
+            row.append(tuple(v * dim for v in color))
+        pixels.append(row)
+    return pixels
+
+
+def star_visibility(elev, cloud):
+    """How strongly stars should show through twilight and cloud."""
+    return clamp((-elev - 4) / 5) * clamp((0.65 - cloud) / 0.5)
+
+
+def local_sidereal_angle(t_utc, lon):
+    """Local mean sidereal angle in radians (sufficient for a background)."""
+    unix_days = t_utc.timestamp() / 86400
+    julian_date = 2440587.5 + unix_days
+    days_since_j2000 = julian_date - 2451545.0
+    gmst = 280.46061837 + 360.98564736629 * days_since_j2000
+    return math.radians((gmst + lon) % 360)
+
+
+def star_mvg(width, height, elev, cloud, c, t_utc, lat, lon):
+    """MVG commands for a fixed star catalog projected at the current time.
+
+    Catalog points live in right ascension/declination, then rotate into local
+    altitude/azimuth using sidereal time.  The screen faces broadly south:
+    east is left, west is right, and stars follow curved diurnal paths.
+    """
+    visibility = star_visibility(elev, cloud)
+    if visibility <= 0:
+        return None
+    tint = c.get("bright_foreground", (0.9, 0.92, 0.94))
+    r, g, b = (round(v * 255) for v in lighten(tint, 0.3))
+    rng = random.Random("skybg-celestial-catalog-v1")
+    catalog_size = max(80, int(3.6e-4 * width * height))
+    lat_r = math.radians(lat)
+    lst = local_sidereal_angle(t_utc, lon)
+    lines = []
+    for _ in range(catalog_size):
+        ra = rng.uniform(0, 2 * math.pi)
+        dec = math.asin(rng.uniform(-1, 1))
+        brightness = rng.uniform(0.10, 0.45)
+        large = rng.random() < 0.07
+
+        hour_angle = lst - ra
+        sin_alt = (math.sin(lat_r) * math.sin(dec)
+                   + math.cos(lat_r) * math.cos(dec) * math.cos(hour_angle))
+        alt = math.asin(clamp(sin_alt, -1, 1))
+        if alt <= 0:
+            continue
+        az = (math.atan2(math.sin(hour_angle),
+                         math.cos(hour_angle) * math.sin(lat_r)
+                         - math.tan(dec) * math.cos(lat_r)) + math.pi) % (2 * math.pi)
+
+        # A wide, south-facing projection preserves the intuitive east-left,
+        # west-right motion while allowing some northern sky at the edges.
+        south_offset = (math.degrees(az) - 180 + 180) % 360 - 180
+        if abs(south_offset) > 110:
+            continue
+        x = width * (0.5 + south_offset / 220)
+        alt_deg = math.degrees(alt)
+        y = height * 0.82 * (1 - (alt_deg / 90) ** 0.75)
+        horizon_fade = smoothstep(0, 8, alt_deg)
+        edge_fade = 1 - smoothstep(92, 110, abs(south_offset))
+        alpha = brightness * visibility * horizon_fade * edge_fade * (0.6 + 0.4 * alt_deg / 90)
+        if alpha < 0.01:
+            continue
+        lines.append(f"fill rgba({r},{g},{b},{alpha:.3f})")
+        if large:
+            lines.append(f"circle {x},{y} {x + 1},{y}")
+        else:
+            lines.append(f"point {x},{y}")
+    return "\n".join(lines)
+
+
+# ---------- rendering ----------
+
+def screen_size():
+    try:
+        out = subprocess.run([which("hyprctl"), "monitors", "-j"],
+                             capture_output=True, text=True, timeout=10).stdout
+        mons = json.loads(out)
+        best = max(mons, key=lambda m: m["width"] * m["height"])
+        w, h = best["width"], best["height"]
+        if best.get("transform", 0) % 2 == 1:
+            w, h = h, w
+        return w, h
+    except Exception:
+        return 2560, 1600
+
+
+def render_sky(out_path, width, height, t_utc, lat, lon, cloud, fog, colors):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    elev, az = solar_position(lat, lon, t_utc)
+    pixels = sky_field(colors, elev, az, cloud, fog)
+
+    ppm_path = os.path.join(STATE_DIR, "field.ppm")
+    with open(ppm_path, "wb") as f:
+        f.write(f"P6\n{GRID_W} {GRID_H}\n65535\n".encode())
+        for row in pixels:
+            for color in row:
+                f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in color)))
+
+    cmd = [which("magick"), ppm_path, "-resize", f"{width}x{height}!",
+           "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8"]
+    mvg = star_mvg(width, height, elev, cloud, colors, t_utc, lat, lon)
+    if mvg:
+        mvg_path = os.path.join(STATE_DIR, "stars.mvg")
+        with open(mvg_path, "w") as f:
+            f.write(mvg)
+        cmd += ["-draw", f"@{mvg_path}"]
+    temporary = out_path + ".tmp.png"
+    subprocess.run(cmd + [temporary], check=True, timeout=60)
+    os.replace(temporary, out_path)
+    return elev, az
+
+
+def generate_and_set():
+    with render_lock():
+        lat, lon = get_location()
+        cloud, fog = get_weather(lat, lon)
+        width, height = screen_size()
+
+        # Alternate names so Quattro's background watcher sees a new target.
+        current = os.path.realpath(BACKGROUND_LINK) if os.path.islink(BACKGROUND_LINK) else ""
+        out_path = os.path.join(STATE_DIR, "sky-b.png" if current.endswith("sky-a.png") else "sky-a.png")
+
+        elev, az = render_sky(out_path, width, height,
+                              datetime.datetime.now(datetime.timezone.utc),
+                              lat, lon, cloud, fog, theme_colors())
+        subprocess.run([which("omarchy"), "theme", "bg", "set", out_path], check=True, timeout=30)
+    return elev, cloud, fog
+
+
+def render_preview(cloud_override=None):
+    lat, lon = get_location()
+    if cloud_override is None:
+        cloud, fog = get_weather(lat, lon)
+    else:
+        cloud, fog = clamp(cloud_override / 100), False
+    colors = theme_colors()
+    now_local = datetime.datetime.now().astimezone()
+    panels = []
+    for hour in range(24):
+        local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0)
+        t_utc = local.astimezone(datetime.timezone.utc)
+        panel = os.path.join(STATE_DIR, f"preview-{hour:02d}.png")
+        elev, _ = render_sky(panel, 130, 300, t_utc, lat, lon, cloud, fog, colors)
+        subprocess.run([which("magick"), panel, "-set", "label",
+                        f"{hour:02d}:00  {elev:+.0f}°", panel], check=True)
+        panels.append(panel)
+    out = os.path.join(HOME, "Pictures/skybg-day-preview.png")
+    temporary = out + ".tmp.png"
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    subprocess.run([which("montage")] + panels + [
+        "-tile", "8x3", "-geometry", "+3+3", "-background", "#111",
+        "-fill", "#ccc", "-pointsize", "13", temporary], check=True)
+    os.replace(temporary, out)
+    for panel in panels:
+        os.remove(panel)
+    return out, cloud
+
+
+def owns_background():
+    if not os.path.islink(BACKGROUND_LINK):
+        return False
+    return os.path.realpath(BACKGROUND_LINK).startswith(os.path.realpath(STATE_DIR))
+
+
+def timer_active():
+    return subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", "skybg.timer"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+# ---------- commands ----------
+
+def weather_words(cloud, fog):
+    if fog:
+        return "fog"
+    return f"{round(cloud * 100)}% cloud"
+
+
+def configure(args):
+    config = load_config()
+    if args.config_command == "show":
+        print(f"location: {config['location']}")
+        print(f"weather: {'on' if config['weather'] else 'off'}")
+    elif args.config_command == "location":
+        if args.latitude == "auto":
+            if args.longitude is not None:
+                raise SkybgError("'auto' does not take a longitude")
+            config["location"] = "auto"
+        else:
+            try:
+                lat, lon = float(args.latitude), float(args.longitude)
+            except (TypeError, ValueError) as exc:
+                raise SkybgError("location requires LAT LON, or 'auto'") from exc
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise SkybgError("latitude must be -90..90 and longitude -180..180")
+            config["location"] = [lat, lon]
+        save_config(config)
+        print(f"saved {CONFIG_FILE}")
+    elif args.config_command == "weather":
+        config["weather"] = args.value == "on"
+        save_config(config)
+        print(f"weather {'enabled' if config['weather'] else 'disabled'}")
+
+
+def doctor():
+    checks = []
+    for command in ("omarchy", "magick", "montage", "systemctl"):
+        checks.append((command, shutil.which(command) is not None, "required command"))
+    checks.append(("Omarchy theme", os.path.isfile(COLORS_TOML), COLORS_TOML))
+    checks.append(("Hyprland session", bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")),
+                   "monitor size falls back to 2560x1600 when unavailable"))
+    try:
+        lat, lon = get_location()
+        checks.append(("location", True, f"{lat:.4f}, {lon:.4f}"))
+    except SkybgError as exc:
+        checks.append(("location", False, str(exc)))
+    unit_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+                            "systemd/user")
+    for unit in ("skybg.service", "skybg.timer"):
+        checks.append((unit, os.path.isfile(os.path.join(unit_dir, unit)), "installed user unit"))
+    for name, okay, detail in checks:
+        print(f"{'ok' if okay else 'FAIL':4}  {name}: {detail}")
+    return all(okay for name, okay, detail in checks if name != "Hyprland session")
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    commands = p.add_subparsers(dest="command")
+    for name in ("on", "off", "once", "tick", "status", "doctor"):
+        commands.add_parser(name)
+    preview = commands.add_parser("preview")
+    preview.add_argument("cloud", nargs="?", type=float, metavar="0..100")
+    config = commands.add_parser("config")
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    config_commands.add_parser("show")
+    location = config_commands.add_parser("location")
+    location.add_argument("latitude", help="latitude, or 'auto'")
+    location.add_argument("longitude", nargs="?")
+    weather = config_commands.add_parser("weather")
+    weather.add_argument("value", choices=("on", "off"))
+    return p
+
+
+def run(args):
+    cmd = args.command or "status"
+
+    if cmd == "on":
+        if os.path.exists(FOREIGN_MARKER):
+            os.remove(FOREIGN_MARKER)
+        elev, cloud, fog = generate_and_set()
+        subprocess.run(["systemctl", "--user", "enable", "--now", "skybg.timer"], check=True)
+        print(f"skybg on — sun at {elev:+.1f}° ({phase_name(elev)}), "
+              f"{weather_words(cloud, fog)}, refreshing every 5 minutes")
+    elif cmd == "off":
+        if os.path.exists(FOREIGN_MARKER):
+            os.remove(FOREIGN_MARKER)
+        subprocess.run(["systemctl", "--user", "disable", "--now", "skybg.timer"])
+        print("skybg off — background left as-is")
+    elif cmd == "once":
+        elev, cloud, fog = generate_and_set()
+        print(f"skybg — sun at {elev:+.1f}° ({phase_name(elev)}), {weather_words(cloud, fog)}")
+    elif cmd == "tick":
+        if owns_background():
+            if os.path.exists(FOREIGN_MARKER):
+                os.remove(FOREIGN_MARKER)
+            generate_and_set()
+        elif os.path.exists(FOREIGN_MARKER):
+            # Foreign background two ticks in a row: the user really did switch
+            # away (e.g. cycled to a photo). Bow out gracefully.
+            os.remove(FOREIGN_MARKER)
+            subprocess.run(["systemctl", "--user", "disable", "--now", "skybg.timer"])
+        else:
+            # First foreign sighting may just be a theme-change transition
+            # racing this tick (the theme-set hook re-owns shortly after).
+            # Leave the background alone and decide next tick.
+            open(FOREIGN_MARKER, "w").close()
+    elif cmd == "preview":
+        if args.cloud is not None and not 0 <= args.cloud <= 100:
+            raise SkybgError("preview cloud cover must be between 0 and 100")
+        with render_lock():
+            out, cloud = render_preview(args.cloud)
+        print(f"wrote {out} ({round(cloud * 100)}% cloud)")
+    elif cmd == "status":
+        lat, lon = get_location()
+        cloud, fog = get_weather(lat, lon)
+        elev, az = solar_position(lat, lon, datetime.datetime.now(datetime.timezone.utc))
+        stars = star_visibility(elev, max(cloud, 0.85) if fog else cloud) > 0
+        print(f"location: {lat:.4f}, {lon:.4f}")
+        print(f"sun: {elev:+.1f}° elevation, {az:.0f}° azimuth ({phase_name(elev)})")
+        print(f"weather: {weather_words(cloud, fog)} — stars {'visible' if stars else 'hidden'}")
+        print(f"timer: {'active' if timer_active() else 'inactive'}")
+        print(f"background owned by skybg: {'yes' if owns_background() else 'no'}")
+    elif cmd == "doctor":
+        return 0 if doctor() else 1
+    elif cmd == "config":
+        configure(args)
+    return 0
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        return run(args)
+    except SkybgError as exc:
+        print(f"skybg: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"skybg: required command not found: {exc.filename}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as exc:
+        print(f"skybg: command failed ({exc.returncode}): {' '.join(exc.cmd)}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

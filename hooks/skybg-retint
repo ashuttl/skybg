@@ -1,0 +1,7 @@
+#!/bin/bash
+# theme-set hook: if skybg mode is active, re-tint the sky gradient with the
+# new theme's colors (after the theme's own background transition settles).
+if systemctl --user is-active --quiet skybg.timer; then
+  sleep 3
+  "$HOME/.local/bin/skybg" once
+fi
