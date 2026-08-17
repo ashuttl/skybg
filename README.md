@@ -9,7 +9,7 @@ elevation and azimuth, and current cloud cover. A soft glow crosses the screen
 from east to west; cloud and fog flatten the sky; clear nights reveal a fixed
 celestial sphere that turns with sidereal time.
 
-It is built for Omarchy 4 (Quattro). Change themes and the sky retints itself.
+It is built for Omarchy Quattro. Change themes and the sky retints itself.
 Choose another background and `skybg` bows out after confirming the change.
 
 | Sunrise | Clear night |
@@ -18,7 +18,7 @@ Choose another background and `skybg` bows out after confirming the change.
 
 ## Requirements
 
-- Omarchy 4 with Hyprland and the Omarchy shell
+- Omarchy Quattro
 - Python 3.11 or newer
 - ImageMagick (`magick` and `montage`)
 - systemd user services
