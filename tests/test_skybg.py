@@ -1,9 +1,11 @@
 import datetime
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -64,6 +66,19 @@ class ColorTests(unittest.TestCase):
         pixels = skybg.sky_field(colors, 2, 105, 0.4, False)
         self.assertTrue(all(0 <= channel <= 1 for row in pixels for pixel in row for channel in pixel))
 
+    def test_builtin_palettes_render_colorful_sunsets(self):
+        # The built-in macOS palettes have no terminal theme to defer to, so
+        # they should produce a genuinely colorful sky: a washed-out palette
+        # collapses every stop toward gray (channel spread near zero).
+        for appearance in ("light", "dark"):
+            with mock.patch.object(skybg, "theme_source",
+                                   return_value=("builtin", appearance)):
+                colors = skybg.theme_colors()
+            _, _, horizon = skybg.sky_stops(0, colors)  # sunset
+            self.assertGreater(max(horizon) - min(horizon), 0.15, appearance)
+            zenith, _, _ = skybg.sky_stops(40, colors)  # midday
+            self.assertGreater(zenith[2] - zenith[0], 0.05, appearance)  # blue > red
+
     def test_star_catalog_is_deterministic(self):
         colors = {"bright_foreground": (0.8, 0.8, 0.8)}
         instant = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
@@ -71,6 +86,35 @@ class ColorTests(unittest.TestCase):
         second = skybg.star_mvg(800, 600, -20, 0, colors, instant, 43, -70)
         self.assertEqual(first, second)
         self.assertIn("fill rgba", first)
+
+
+class WeatherTests(unittest.TestCase):
+    def _get_weather(self, directory, lat, lon, fetched_cloud=100):
+        response = io.BytesIO(json.dumps(
+            {"current": {"cloud_cover": fetched_cloud, "weather_code": 3}}).encode())
+        with mock.patch.object(skybg, "STATE_DIR", directory), \
+                mock.patch.object(skybg, "WEATHER_CACHE",
+                                  os.path.join(directory, "weather.json")), \
+                mock.patch.object(skybg, "load_config",
+                                  return_value={"location": "auto", "weather": True}), \
+                mock.patch.object(skybg.urllib.request, "urlopen", return_value=response):
+            return skybg.get_weather(lat, lon)
+
+    def test_weather_cache_is_keyed_by_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "weather.json"), "w") as f:
+                json.dump({"ts": time.time(), "cloud": 0.01, "fog": False,
+                           "lat": 33.5, "lon": 36.2}, f)
+            # Same location: fresh cache wins over the (cloudier) live fetch.
+            self.assertEqual(self._get_weather(directory, 33.5, 36.2), (0.01, False))
+            # Moved away: the cache is stale regardless of TTL — refetch.
+            self.assertEqual(self._get_weather(directory, 43.677, -70.371), (1.0, False))
+
+    def test_pre_location_cache_is_refetched_not_crashed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "weather.json"), "w") as f:
+                json.dump({"ts": time.time(), "cloud": 0.01, "fog": False}, f)
+            self.assertEqual(self._get_weather(directory, 33.5, 36.2), (1.0, False))
 
 
 class ConfigAndCliTests(unittest.TestCase):

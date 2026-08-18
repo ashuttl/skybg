@@ -155,7 +155,11 @@ def get_weather(lat, lon):
     try:
         with open(WEATHER_CACHE) as f:
             cached = json.load(f)
-        if time.time() - cached["ts"] < WEATHER_TTL:
+        # A cache from a different location is useless, even as a last-known
+        # fallback (0.05° ≈ 5 km, comfortably inside forecast granularity).
+        if abs(cached["lat"] - lat) > 0.05 or abs(cached["lon"] - lon) > 0.05:
+            cached = None
+        elif time.time() - cached["ts"] < WEATHER_TTL:
             return cached["cloud"], cached["fog"]
     except Exception:
         cached = None
@@ -169,7 +173,8 @@ def get_weather(lat, lon):
         fog = current["weather_code"] in FOG_CODES
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(WEATHER_CACHE, "w") as f:
-            json.dump({"ts": time.time(), "cloud": cloud, "fog": fog}, f)
+            json.dump({"ts": time.time(), "cloud": cloud, "fog": fog,
+                       "lat": lat, "lon": lon}, f)
         return cloud, fog
     except Exception:
         if cached:
@@ -236,8 +241,18 @@ HUE_DEFAULTS = {"red": "#b05f58", "green": "#6f9a76", "yellow": "#c4a76a",
                 "blue": "#6d8fb4", "cyan": "#6fa7a0", "magenta": "#9a7fa8"}
 
 
-BASE_DEFAULTS = {"dark": {"background": "#20242b", "foreground": "#d0d5da"},
-                 "light": {"background": "#dde3ea", "foreground": "#343b44"}}
+# With no theme to match, aim for a realistic sky rather than a neutral one:
+# saturated hue anchors, and a dusk-blue background even for the light
+# appearance (the background is the night sky, and every daytime stop mixes
+# from it, so a near-gray background washes out the whole cycle).
+BASE_DEFAULTS = {
+    "dark": {"background": "#1c2536", "foreground": "#dce4f0",
+             "blue": "#3a80d8", "cyan": "#86c8e8", "magenta": "#a96bb4",
+             "red": "#d95c48", "yellow": "#f0bd62", "orange": "#e08a52"},
+    "light": {"background": "#3a4a68", "foreground": "#eef3fa",
+              "blue": "#4a90e0", "cyan": "#8fd8f0", "magenta": "#c078b8",
+              "red": "#e86a50", "yellow": "#f8d078", "orange": "#f09055"},
+}
 
 
 def macos_dark_mode():
