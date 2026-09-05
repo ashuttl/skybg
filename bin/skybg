@@ -246,10 +246,10 @@ HUE_DEFAULTS = {"red": "#b05f58", "green": "#6f9a76", "yellow": "#c4a76a",
 # appearance (the background is the night sky, and every daytime stop mixes
 # from it, so a near-gray background washes out the whole cycle).
 BASE_DEFAULTS = {
-    "dark": {"background": "#1c2536", "foreground": "#dce4f0",
+    "dark": {"background": "#1c2536", "foreground": "#dce4f0", "bright_foreground": "#c8d4f0",
              "blue": "#3a80d8", "cyan": "#86c8e8", "magenta": "#a96bb4",
              "red": "#d95c48", "yellow": "#f0bd62", "orange": "#e08a52"},
-    "light": {"background": "#3a4a68", "foreground": "#eef3fa",
+    "light": {"background": "#3a4a68", "foreground": "#eef3fa", "bright_foreground": "#d4e0f6",
               "blue": "#4a90e0", "cyan": "#8fd8f0", "magenta": "#c078b8",
               "red": "#e86a50", "yellow": "#f8d078", "orange": "#f09055"},
 }
@@ -309,24 +309,59 @@ def theme_colors():
     return c
 
 
+# How bright the day sky gets. At 1.0 it is linecast's sky, mixed from the
+# theme's hues toward its bright foreground; lower mixes the day back toward
+# the theme background, which suits a wallpaper behind dark windows.
+DAY_BRIGHTNESS = 0.7
+
+
 def sky_stops(elev, c):
-    """(zenith, mid, horizon) colors for a sun elevation, blended from theme colors."""
+    """(zenith, far, near) colors for a sun elevation, blended from theme
+    colors: the sky overhead, the horizon opposite the sun, and the horizon
+    under it.
+
+    The shape follows linecast's sky view. Through twilight the sunward
+    horizon runs magenta, red, then orange while the far side holds the
+    mauve of the Earth's shadow; by day the horizon is paler than the
+    zenith, not darker, as the air whitens it."""
     bg = c["background"]
     dbg = c.get("darker_background", bg)
     lbg = c.get("lighter_background", bg)
     blue, cyan = c["blue"], c["cyan"]
     mag, orange, red, yellow = c["magenta"], c["orange"], c["red"], c["yellow"]
 
-    dusk_h = lerp(red, mag, 0.5)
+    # By day the sky mixes from the theme's hues toward its bright
+    # foreground, as linecast's sky does toward white: a day sky that mixed
+    # from a dark theme's background stayed a dusk. Toward the sun the
+    # horizon leans to the theme's cyan, but only part way: a teal cyan
+    # beside a blue sky reads as green.
+    # A touch of the sky's own blue keeps a near-white foreground from
+    # bleaching the noon sky.
+    white = lerp(c.get("bright_foreground", (0.9, 0.92, 0.95)), blue, 0.15)
+    sky_cyan = lerp(blue, cyan, 0.6)
+    cream = lerp(yellow, white, 0.5)
+
+    def day(color):
+        return lerp(bg, color, DAY_BRIGHTNESS)
     keyframes = [
-        (-18, (dbg, lerp(dbg, bg, 0.5), bg)),
-        (-9, (dbg, lerp(dbg, bg, 0.8), lerp(bg, blue, 0.20))),
-        (-4, (lerp(dbg, blue, 0.10), lerp(bg, mag, 0.25), lerp(bg, dusk_h, 0.45))),
-        (0, (lerp(bg, blue, 0.25), lerp(bg, mag, 0.40), lerp(bg, orange, 0.70))),
-        (4, (lerp(bg, blue, 0.40), lerp(lbg, cyan, 0.25), lerp(lbg, yellow, 0.45))),
-        (12, (lerp(bg, blue, 0.50), lerp(lbg, blue, 0.35), lerp(lbg, cyan, 0.40))),
-        (50, (lighten(lerp(bg, blue, 0.55), 0.06), lerp(lbg, blue, 0.45),
-              lighten(lerp(lbg, cyan, 0.45), 0.05))),
+        (-18, (dbg, bg, bg)),
+        (-12, (lerp(dbg, blue, 0.06), lerp(bg, mag, 0.10), lerp(bg, mag, 0.18))),
+        (-6, (lerp(dbg, blue, 0.12), lerp(bg, mag, 0.30),
+              lerp(bg, lerp(red, mag, 0.5), 0.45))),
+        (-3, (lerp(bg, mag, 0.20), lerp(bg, lerp(mag, red, 0.3), 0.45),
+              lerp(bg, lerp(red, mag, 0.25), 0.70))),
+        (0, (lerp(bg, lerp(mag, blue, 0.35), 0.45), lerp(bg, lerp(red, mag, 0.4), 0.55),
+             lerp(bg, lerp(orange, yellow, 0.3), 0.85))),
+        (3, (lerp(bg, lerp(mag, blue, 0.5), 0.65), lerp(bg, lerp(mag, cyan, 0.3), 0.65),
+             lerp(lerp(yellow, orange, 0.3), white, 0.15))),
+        (8, (day(lerp(blue, cyan, 0.20)), day(lerp(lerp(blue, cyan, 0.5), white, 0.30)),
+             day(cream))),
+        (15, (day(lerp(blue, cyan, 0.35)), day(lerp(blue, white, 0.52)),
+              day(lerp(sky_cyan, white, 0.55)))),
+        (30, (day(lerp(blue, white, 0.45)), day(lerp(blue, white, 0.70)),
+              day(lerp(sky_cyan, white, 0.72)))),
+        (90, (day(lerp(blue, white, 0.60)), day(lerp(blue, white, 0.80)),
+              day(lerp(sky_cyan, white, 0.82)))),
     ]
 
     if elev <= keyframes[0][0]:
@@ -342,30 +377,46 @@ def sky_stops(elev, c):
 # ---------- sky field ----------
 
 GRID_W, GRID_H = 64, 40
+AZ_SPAN = 257.0   # degrees of azimuth across the screen, centred on south
+ALT_TOP = 60.0    # altitude at the top edge; the bottom edge is the horizon
+
+
+def sun_screen_x(az):
+    """Where an azimuth falls across the screen: east left, west right."""
+    return 0.5 + (az - 180) / AZ_SPAN
 
 
 def sky_field(c, elev, az, cloud, fog):
-    """Small 2D pixel grid: vertical gradient + sun glow + weather graying."""
+    """Small 2D pixel grid: the sky by altitude and by bearing from the
+    sun, a glow about the sun, and weather graying."""
     if fog:
         cloud = max(cloud, 0.85)
-    zenith, mid, horizon = sky_stops(elev, c)
+    zenith, far, near = sky_stops(elev, c)
+    night = c.get("darker_background", c["background"])
 
-    # Overcast flattens the sky: horizon pulls toward mid, contrast shrinks.
-    horizon = lerp(horizon, mid, 0.35 * cloud)
-    zenith = lerp(zenith, mid, 0.15 * cloud)
+    # Cloud hides the sunward glow and flattens the sky toward one tone.
+    near = lerp(near, far, 0.7 * cloud)
+    far = lerp(far, zenith, 0.35 * cloud)
+    near = lerp(near, zenith, 0.35 * cloud)
+    zenith = lerp(zenith, far, 0.15 * cloud)
 
     # Afternoon runs slightly warmer than morning.
     warm = 0.10 * smoothstep(180, 250, az) * smoothstep(4, 15, elev)
     if warm > 0:
-        mid = lerp(mid, c["yellow"], warm * 0.5)
-        horizon = lerp(horizon, c["orange"], warm)
+        near = lerp(near, c["orange"], warm)
+
+    # The horizon's colour reaches up the sky a little at night and in
+    # twilight and a long way by day (an exponential in altitude, its scale
+    # height in degrees); toward the zenith the twilight sky keeps some night.
+    height = 18.0 + 30.0 * clamp(elev / 30)
+    brightness = clamp((elev + 18) / 18)
 
     # Sun screen position: azimuth east->left, west->right; low sun sits low.
-    sun_x = clamp(0.15 + 0.7 * (az - 90) / 180, 0.06, 0.94)
+    sun_x = clamp(sun_screen_x(az), 0.06, 0.94)
     sun_y = 1.05 - 0.9 * clamp((elev + 6) / 66)
     sigma = 0.33 + 0.15 * clamp(elev / 60)
-    glow_strength = (0.5 * math.exp(-((elev - 1) / 11) ** 2)
-                     + 0.14 * smoothstep(10, 30, elev))
+    glow_strength = (0.4 * math.exp(-((elev - 1) / 11) ** 2)
+                     + 0.12 * smoothstep(10, 30, elev))
     glow_strength *= (1 - 0.85 * cloud)
     if elev < -7:
         glow_strength = 0.0
@@ -374,17 +425,25 @@ def sky_field(c, elev, az, cloud, fog):
     gray_w = 0.55 * cloud
     dim = 1 - 0.07 * cloud * smoothstep(0, 8, elev)
 
+    # Each column's bearing from the sun: 1 under it, 0 opposite, bell-shaped
+    # about it, so the warm side stays a band and the far side keeps its mauve.
+    sun_az = math.radians(az)
+    toward = []
+    for gx in range(GRID_W):
+        col_az = math.radians(180 + (gx / (GRID_W - 1) - 0.5) * AZ_SPAN)
+        toward.append(((1 + math.cos(col_az - sun_az)) / 2) ** 4)
+
     pixels = []
     for gy in range(GRID_H):
         p = gy / (GRID_H - 1)
-        if p <= 0.58:
-            base = lerp(zenith, mid, (1 - math.cos(p / 0.58 * math.pi)) / 2)
-        else:
-            base = lerp(mid, horizon, (1 - math.cos((p - 0.58) / 0.42 * math.pi)) / 2)
+        alt = ALT_TOP * (1 - p)
+        v = math.exp(-alt / height)
+        keep = brightness + (1 - brightness) * v
         row = []
         for gx in range(GRID_W):
             x = gx / (GRID_W - 1)
-            color = base
+            horizon = lerp(far, near, toward[gx])
+            color = lerp(night, lerp(zenith, horizon, v), keep)
             if glow_strength > 0:
                 d2 = ((x - sun_x) / (sigma * 1.7)) ** 2 + ((p - sun_y) / sigma) ** 2
                 g = glow_strength * math.exp(-d2)
@@ -392,7 +451,7 @@ def sky_field(c, elev, az, cloud, fog):
                     color = lerp(color, glow_color, clamp(g, 0, 0.55))
             if gray_w > 0:
                 color = lerp(color, gray_of(color), gray_w)
-            row.append(tuple(v * dim for v in color))
+            row.append(tuple(v_ * dim for v_ in color))
         pixels.append(row)
     return pixels
 

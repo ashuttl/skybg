@@ -6,8 +6,9 @@
 
 `skybg` renders a quiet gradient from the active Omarchy theme, the sun's
 elevation and azimuth, and current cloud cover. A soft glow crosses the screen
-from east to west; cloud and fog flatten the sky; clear nights reveal a fixed
-celestial sphere that turns with sidereal time.
+from east to west, the horizon warming under the sun and holding the mauve of
+the Earth's shadow opposite it; cloud and fog flatten the sky; clear nights
+reveal a fixed celestial sphere that turns with sidereal time.
 
 It is built for Omarchy Quattro. Change themes and the sky retints itself.
 Choose another background and `skybg` bows out after confirming the change.

@@ -74,10 +74,30 @@ class ColorTests(unittest.TestCase):
             with mock.patch.object(skybg, "theme_source",
                                    return_value=("builtin", appearance)):
                 colors = skybg.theme_colors()
-            _, _, horizon = skybg.sky_stops(0, colors)  # sunset
-            self.assertGreater(max(horizon) - min(horizon), 0.15, appearance)
+            _, _, near = skybg.sky_stops(0, colors)  # sunset, under the sun
+            self.assertGreater(max(near) - min(near), 0.15, appearance)
             zenith, _, _ = skybg.sky_stops(40, colors)  # midday
             self.assertGreater(zenith[2] - zenith[0], 0.05, appearance)  # blue > red
+
+    def test_sky_stops_follow_the_sky(self):
+        # After linecast's sky view: at sunset the horizon under the sun is
+        # warmer than the horizon opposite it, and by day the horizon is
+        # paler than the zenith, not darker.
+        with mock.patch.object(skybg, "theme_source", return_value=("builtin", "dark")):
+            colors = skybg.theme_colors()
+        _, far, near = skybg.sky_stops(0, colors)
+        self.assertGreater(near[0] - near[2], far[0] - far[2])  # near is redder
+        zenith, far, near = skybg.sky_stops(40, colors)
+        self.assertGreater(sum(far), sum(zenith))
+        self.assertGreater(sum(near), sum(zenith))
+
+    def test_sky_field_warms_toward_the_sun(self):
+        with mock.patch.object(skybg, "theme_source", return_value=("builtin", "dark")):
+            colors = skybg.theme_colors()
+        pixels = skybg.sky_field(colors, 0, 270, 0.0, False)  # sunset in the west
+        bottom = pixels[-1]
+        west, east = bottom[-1], bottom[0]
+        self.assertGreater(west[0] - west[2], east[0] - east[2])
 
     def test_star_catalog_is_deterministic(self):
         colors = {"bright_foreground": (0.8, 0.8, 0.8)}
