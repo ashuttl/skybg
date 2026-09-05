@@ -424,15 +424,15 @@ def star_mvg(width, height, elev, cloud, c, t_utc, lat, lon):
     tint = c.get("bright_foreground", (0.9, 0.92, 0.94))
     r, g, b = (round(v * 255) for v in lighten(tint, 0.3))
     rng = random.Random("skybg-celestial-catalog-v1")
-    catalog_size = max(80, int(3.6e-4 * width * height))
+    catalog_size = max(100, int(4.3e-4 * width * height))
     lat_r = math.radians(lat)
     lst = local_sidereal_angle(t_utc, lon)
     lines = []
     for _ in range(catalog_size):
         ra = rng.uniform(0, 2 * math.pi)
         dec = math.asin(rng.uniform(-1, 1))
-        brightness = rng.uniform(0.10, 0.45)
-        large = rng.random() < 0.07
+        brightness = rng.uniform(0.12, 0.54)
+        large = rng.random() < 0.10
 
         hour_angle = lst - ra
         sin_alt = (math.sin(lat_r) * math.sin(dec)
