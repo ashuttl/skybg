@@ -9,6 +9,7 @@ fi
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BIN_DIR=${HOME}/.local/bin
 UNIT_DIR=${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user
+DATA_DIR=${XDG_DATA_HOME:-${HOME}/.local/share}/skybg
 PLATFORM=$(uname -s)
 
 if [[ $PLATFORM == Darwin ]]; then
@@ -39,9 +40,12 @@ backup_if_changed() {
   fi
 }
 
-mkdir -p "$BIN_DIR"
+mkdir -p "$BIN_DIR" "$DATA_DIR"
 backup_if_changed "$ROOT/bin/skybg" "$BIN_DIR/skybg"
 install -m 755 "$ROOT/bin/skybg" "$BIN_DIR/skybg"
+for name in stars.bin milkyway.bin.gz SOURCES.md; do
+  install -m 644 "$ROOT/data/$name" "$DATA_DIR/$name"
+done
 
 if [[ $PLATFORM == Darwin ]]; then
   AGENT_DIR=${HOME}/Library/LaunchAgents

@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import math
 import os
 import tempfile
 import time
@@ -106,6 +107,111 @@ class ColorTests(unittest.TestCase):
         second = skybg.star_mvg(800, 600, -20, 0, colors, instant, 43, -70)
         self.assertEqual(first, second)
         self.assertIn("fill rgba", first)
+
+
+def equatorial(ra_deg, dec_deg):
+    ra, dec = math.radians(ra_deg), math.radians(dec_deg)
+    return (math.cos(dec) * math.cos(ra), math.cos(dec) * math.sin(ra), math.sin(dec))
+
+
+def screen_position(name_vector, width, height, instant, lat, lon):
+    cam, _, f, _ = skybg.camera(width, height, lat, instant, lon)
+    c = tuple(sum(row[k] * name_vector[k] for k in range(3)) for row in cam)
+    return skybg.project(c, f, width / 2, height / 2)
+
+
+class SkyDataTests(unittest.TestCase):
+    def test_catalogue_is_the_bright_star_catalogue(self):
+        stars = skybg.load_stars()
+        self.assertEqual(len(stars), 8404)
+        self.assertLess(stars[0][3], -1.4)   # Sirius first
+        self.assertTrue(all(mag <= 6.5 for _, _, _, mag, _ in stars))
+
+    def test_milky_way_raster_has_a_bright_bulge(self):
+        raster = skybg.load_milky_way()
+        w, h = skybg.MILKY_WAY_W, skybg.MILKY_WAY_H
+        # Galactic centre: RA 266.4, Dec -29.0. Right ascension runs leftward
+        # from the middle column; the celestial pole is the top row.
+        col = int(w / 2 - 266.4 * w / 360) % w
+        row = int((90 + 29.0) * h / 180)
+        bulge = max(raster[r * w + (col + dc) % w]
+                    for r in range(row - 15, row + 16) for dc in range(-15, 16))
+        self.assertGreater(bulge, 150)
+        # The north galactic pole, in Coma Berenices, is far from the band.
+        col = int(w / 2 - 192.86 * w / 360) % w
+        row = int((90 - 27.13) * h / 180)
+        self.assertLess(raster[row * w + col], 20)
+
+    def test_missing_data_is_reported(self):
+        with mock.patch.dict(os.environ, {"SKYBG_DATA": "/nonexistent", "XDG_DATA_HOME": "/nonexistent"}), \
+                mock.patch.object(skybg.os.path, "realpath", return_value="/nonexistent/bin/skybg"):
+            with self.assertRaises(skybg.SkybgError):
+                skybg.data_dir()
+
+
+class CameraTests(unittest.TestCase):
+    instant = datetime.datetime(2026, 9, 6, 2, 25, tzinfo=datetime.timezone.utc)
+
+    def test_projection_round_trips(self):
+        cam, inverse, f, _ = skybg.camera(2880, 1800, 43.7, self.instant, -70.4)
+        for px, py in ((10.0, 10.0), (1440.0, 900.0), (2870.0, 1790.0)):
+            c = skybg.unproject(px, py, f, 1440, 900)
+            self.assertAlmostEqual(sum(v * v for v in c), 1.0, places=9)
+            qx, qy, qz = skybg.project(c, f, 1440, 900) + (0,)
+            self.assertAlmostEqual(qx, px, places=6)
+            self.assertAlmostEqual(qy, py, places=6)
+            q = tuple(sum(row[k] * c[k] for k in range(3)) for row in inverse)
+            back = tuple(sum(row[k] * q[k] for k in range(3)) for row in cam)
+            for a, b in zip(back, c):
+                self.assertAlmostEqual(a, b, places=9)
+
+    def test_polaris_keeps_the_latitude(self):
+        polaris = equatorial(37.95, 89.26)
+        for hour in (0, 6, 12, 18):
+            instant = self.instant.replace(hour=hour)
+            _, _, _, horizontal = skybg.camera(2880, 1800, 43.7, instant, -70.4)
+            self.assertAlmostEqual(skybg.altitude_of(polaris, horizontal), 43.7, delta=0.8)
+
+    def test_facing_south_puts_the_horizon_at_the_bottom(self):
+        # Straight down the middle of the bottom edge lies the horizon.
+        _, inverse, f, horizontal = skybg.camera(2880, 1800, 43.7, self.instant, -70.4)
+        c = skybg.unproject(1440, 1800, f, 1440, 900)
+        q = tuple(sum(row[k] * c[k] for k in range(3)) for row in inverse)
+        self.assertAlmostEqual(skybg.altitude_of(q, horizontal), 0.0, places=6)
+
+    def test_stars_rise_on_the_left_and_set_on_the_right(self):
+        # Altair, seen from Maine on a September evening, is high and a
+        # little west of south; two hours on it has moved right.
+        altair = equatorial(297.7, 8.87)
+        first = screen_position(altair, 2880, 1800, self.instant, 43.7, -70.4)
+        later = screen_position(altair, 2880, 1800, self.instant + datetime.timedelta(hours=2),
+                                43.7, -70.4)
+        self.assertIsNotNone(first)
+        self.assertGreater(later[0], first[0])
+
+    def test_southern_hemisphere_faces_north(self):
+        # From Sydney the same evening, Altair is in the north: on screen
+        # when facing north, and east is now on the right, so it sets leftward.
+        altair = equatorial(297.7, 8.87)
+        instant = datetime.datetime(2026, 9, 6, 10, 0, tzinfo=datetime.timezone.utc)
+        first = screen_position(altair, 2880, 1800, instant, -33.9, 151.2)
+        later = screen_position(altair, 2880, 1800, instant + datetime.timedelta(hours=1),
+                                -33.9, 151.2)
+        self.assertIsNotNone(first)
+        self.assertLess(later[0], first[0])
+
+
+class MilkyWayLayerTests(unittest.TestCase):
+    colors = {"bright_foreground": (0.8, 0.8, 0.8)}
+
+    def test_waits_for_astronomical_dark(self):
+        instant = datetime.datetime(2026, 9, 6, 2, 25, tzinfo=datetime.timezone.utc)
+        self.assertIsNone(skybg.milky_way_ppm(120, 75, -9, 0, self.colors, instant, 43.7, -70.4))
+        self.assertIsNone(skybg.milky_way_ppm(120, 75, -30, 0.7, self.colors, instant, 43.7, -70.4))
+        layer = skybg.milky_way_ppm(120, 75, -30, 0, self.colors, instant, 43.7, -70.4)
+        self.assertTrue(layer.startswith(b"P6\n20 12\n255\n"))
+        self.assertEqual(len(layer), len(b"P6\n20 12\n255\n") + 20 * 12 * 3)
+        self.assertGreater(max(layer[len(b"P6\n20 12\n255\n"):]), 30)
 
 
 class WeatherTests(unittest.TestCase):

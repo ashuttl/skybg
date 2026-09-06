@@ -12,6 +12,7 @@ HOOK=${HOME}/.config/omarchy/hooks/theme-set.d/skybg-retint
 PLIST=${HOME}/Library/LaunchAgents/com.skybg.tick.plist
 CONFIG_DIR=${XDG_CONFIG_HOME:-${HOME}/.config}/skybg
 STATE_DIR=${XDG_STATE_HOME:-${HOME}/.local/state}/skybg
+DATA_DIR=${XDG_DATA_HOME:-${HOME}/.local/share}/skybg
 
 if [[ $(uname -s) == Darwin ]]; then
   launchctl bootout "gui/$(id -u)/com.skybg.tick" 2>/dev/null || true
@@ -27,6 +28,10 @@ for path in "${paths[@]}"; do
     echo "Removed $path"
   fi
 done
+if [[ -d $DATA_DIR ]]; then
+  rm -rf -- "$DATA_DIR"
+  echo "Removed $DATA_DIR"
+fi
 if [[ $(uname -s) != Darwin ]]; then
   systemctl --user daemon-reload
 fi

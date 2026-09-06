@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Show the real night sky: the Yale Bright Star Catalogue to the naked-eye
+  limit, each star at its magnitude and colour, and the Milky Way from NASA's
+  Deep Star Maps 2020, both bundled and projected for the location and the
+  hour. The Milky Way waits for astronomical dark and thins toward the horizon
+  and under cloud.
 - Build the sky the way linecast's sky view does: a zenith colour plus two
   horizon colours, one under the sun and one opposite it, blended by bearing,
   with a horizon band that climbs the sky as the sun does. Sunsets now warm

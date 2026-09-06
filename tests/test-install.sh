@@ -6,7 +6,7 @@ TEST_HOME=$(mktemp -d /tmp/skybg-install-test.XXXXXX)
 trap 'rm -rf -- "$TEST_HOME"' EXIT
 PLATFORM=$(uname -s)
 
-mkdir -p "$TEST_HOME/fake-bin" "$TEST_HOME/xdg-config" "$TEST_HOME/xdg-state"
+mkdir -p "$TEST_HOME/fake-bin" "$TEST_HOME/xdg-config" "$TEST_HOME/xdg-state" "$TEST_HOME/xdg-data"
 if [[ $PLATFORM == Darwin ]]; then
   cp /usr/bin/true "$TEST_HOME/fake-bin/launchctl"
 else
@@ -17,12 +17,15 @@ run_isolated() {
   HOME="$TEST_HOME" \
     XDG_CONFIG_HOME="$TEST_HOME/xdg-config" \
     XDG_STATE_HOME="$TEST_HOME/xdg-state" \
+    XDG_DATA_HOME="$TEST_HOME/xdg-data" \
     PATH="$TEST_HOME/fake-bin:$PATH" \
     "$@"
 }
 
 run_isolated "$ROOT/install.sh" >/dev/null
 test -x "$TEST_HOME/.local/bin/skybg"
+test -f "$TEST_HOME/xdg-data/skybg/stars.bin"
+test -f "$TEST_HOME/xdg-data/skybg/milkyway.bin.gz"
 if [[ $PLATFORM == Darwin ]]; then
   PLIST="$TEST_HOME/Library/LaunchAgents/com.skybg.tick.plist"
   test -f "$PLIST"
@@ -36,6 +39,7 @@ fi
 
 run_isolated "$ROOT/uninstall.sh" --purge >/dev/null
 test ! -e "$TEST_HOME/.local/bin/skybg"
+test ! -e "$TEST_HOME/xdg-data/skybg"
 if [[ $PLATFORM == Darwin ]]; then
   test ! -e "$TEST_HOME/Library/LaunchAgents/com.skybg.tick.plist"
 else

@@ -9,8 +9,9 @@ Theme-independent: switch themes and the sky re-tints.
 - A soft glow tracks the sun across the screen (east-left in the morning,
   west-right in the afternoon), strongest around sunrise/sunset.
 - Cloud cover grays and flattens the sky; fog all the more so.
-- On clear nights, a sprinkling of subtle stars follows the celestial sphere,
-  rising in the east and setting in the west as sidereal time advances.
+- On clear nights the real sky comes out: the Yale Bright Star Catalogue and
+  the Milky Way, projected for the place and the hour, rising in the east
+  and setting in the west as sidereal time advances.
 
 Commands:
   skybg on             generate + set the background, and start the 5-minute timer
@@ -29,10 +30,10 @@ import datetime
 import argparse
 import contextlib
 import fcntl
+import gzip
 import json
 import math
 import os
-import random
 import re
 import shutil
 import struct
@@ -461,6 +462,12 @@ def star_visibility(elev, cloud):
     return clamp((-elev - 4) / 5) * clamp((0.65 - cloud) / 0.5)
 
 
+def milky_way_visibility(elev, cloud):
+    """The Milky Way waits for astronomical dark, and thin cloud takes it
+    before it takes the stars."""
+    return clamp((-elev - 12) / 6) * clamp((0.65 - cloud) / 0.5) ** 1.5
+
+
 def local_sidereal_angle(t_utc, lon):
     """Local mean sidereal angle in radians (sufficient for a background)."""
     unix_days = t_utc.timestamp() / 86400
@@ -470,58 +477,219 @@ def local_sidereal_angle(t_utc, lon):
     return math.radians((gmst + lon) % 360)
 
 
-def star_mvg(width, height, elev, cloud, c, t_utc, lat, lon):
-    """MVG commands for a fixed star catalog projected at the current time.
+# ---------- the sky's data ----------
+# The stars are the Yale Bright Star Catalogue to magnitude 6.5; the Milky
+# Way is NASA's Deep Star Maps 2020 diffuse layer as a brightness raster in
+# celestial coordinates. Both are baked by scripts/build-sky-data.py and
+# described in data/SOURCES.md.
 
-    Catalog points live in right ascension/declination, then rotate into local
-    altitude/azimuth using sidereal time.  The screen faces broadly south:
-    east is left, west is right, and stars follow curved diurnal paths.
+MILKY_WAY_W, MILKY_WAY_H = 1080, 540
+_sky_data = {}
+
+
+def data_dir():
+    """The first directory that holds the sky data: $SKYBG_DATA, the
+    checkout's data/ beside this script, or the installed copy."""
+    candidates = [
+        os.environ.get("SKYBG_DATA"),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "data"),
+        os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share")),
+                     "skybg"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(os.path.join(candidate, "stars.bin")):
+            return os.path.normpath(candidate)
+    raise SkybgError("sky data (stars.bin, milkyway.bin.gz) not found; run ./install.sh "
+                     "or set SKYBG_DATA to the checkout's data directory")
+
+
+def load_stars():
+    """The catalogue as (x, y, z, magnitude, B-V) with the unit vector in
+    equatorial coordinates, brightest first."""
+    if "stars" not in _sky_data:
+        with open(os.path.join(data_dir(), "stars.bin"), "rb") as f:
+            raw = f.read()
+        stars = []
+        for ra, dec, mag, bv in struct.iter_unpack("<Hhbb", raw):
+            ra_r, dec_r = math.radians(ra / 100), math.radians(dec / 100)
+            stars.append((math.cos(dec_r) * math.cos(ra_r), math.cos(dec_r) * math.sin(ra_r),
+                          math.sin(dec_r), mag / 10, bv / 50))
+        _sky_data["stars"] = stars
+    return _sky_data["stars"]
+
+
+def load_milky_way():
+    """The Milky Way's brightness, 0-255, row-major; right ascension 0h in
+    the middle column increasing leftward, declination +90 at the top."""
+    if "milky_way" not in _sky_data:
+        with gzip.open(os.path.join(data_dir(), "milkyway.bin.gz"), "rb") as f:
+            raster = f.read()
+        if len(raster) != MILKY_WAY_W * MILKY_WAY_H:
+            raise SkybgError("milkyway.bin.gz is not a %dx%d raster" % (MILKY_WAY_W, MILKY_WAY_H))
+        _sky_data["milky_way"] = raster
+    return _sky_data["milky_way"]
+
+
+# ---------- the camera ----------
+# The observer faces south (north in the southern hemisphere) and looks up
+# enough that the horizon runs along the bottom edge of the screen. The
+# projection is stereographic, so the Milky Way keeps its shape from the
+# horizon to near the zenith, and stars rise on the left and set on the
+# right as sidereal time advances.
+
+FOV = 110.0   # degrees of sky across the width of the screen
+
+
+def camera(width, height, lat, t_utc, lon):
+    """The matrix that takes an equatorial unit vector to camera space
+    (x right, y up, z forward), its transpose, the focal length, and the
+    matrix to the local horizontal frame (east, north, up)."""
+    f = width / (4 * math.tan(math.radians(FOV) / 4))
+    # Looking up until the horizon meets the bottom edge, but never past
+    # the point where the zenith reaches the top: a tall frame keeps some
+    # of the ground instead.
+    pitch = min(math.pi / 4, 2 * math.atan(height / (4 * f)))
+    theta, phi = local_sidereal_angle(t_utc, lon), math.radians(lat)
+    st, ct, sp, cp = math.sin(theta), math.cos(theta), math.sin(phi), math.cos(phi)
+    horizontal = ((-st, ct, 0.0),
+                  (-sp * ct, -sp * st, cp),
+                  (cp * ct, cp * st, sp))
+    facing = -1.0 if lat >= 0 else 1.0   # forward's north component's sign
+    s, c = math.sin(pitch), math.cos(pitch)
+    right = (facing, 0.0, 0.0)           # west is on the right when facing south
+    up = (0.0, -facing * s, c)
+    forward = (0.0, facing * c, s)
+    cam = tuple(tuple(sum(row[k] * horizontal[k][j] for k in range(3)) for j in range(3))
+                for row in (right, up, forward))
+    inverse = tuple(tuple(cam[j][i] for j in range(3)) for i in range(3))
+    return cam, inverse, f, horizontal
+
+
+def project(c, f, cx, cy):
+    """Screen position of a camera-space unit vector, or None behind."""
+    x, y, z = c
+    if z < 0.05:
+        return None
+    return cx + 2 * f * x / (1 + z), cy - 2 * f * y / (1 + z)
+
+
+def unproject(px, py, f, cx, cy):
+    """Camera-space unit vector through a screen position."""
+    u, v = (px - cx) / (2 * f), (cy - py) / (2 * f)
+    rho2 = u * u + v * v
+    d = 1 + rho2
+    return 2 * u / d, 2 * v / d, (1 - rho2) / d
+
+
+def altitude_of(q, horizontal):
+    """Altitude in degrees of an equatorial unit vector."""
+    row = horizontal[2]
+    return math.degrees(math.asin(clamp(row[0] * q[0] + row[1] * q[1] + row[2] * q[2], -1, 1)))
+
+
+# ---------- stars and the Milky Way ----------
+
+def star_tint(base, bv):
+    """The catalogue's B-V colour as a gentle cast on the theme's star colour:
+    blue-white for the hot stars, warm for the giants."""
+    blue = clamp((0.3 - bv) / 0.6) * 0.45
+    warm = clamp((bv - 0.8) / 0.8) * 0.5
+    color = lerp(base, (0.72, 0.82, 1.0), blue)
+    return lerp(color, (1.0, 0.86, 0.66), warm)
+
+
+def star_mvg(width, height, elev, cloud, c, t_utc, lat, lon):
+    """MVG commands drawing the catalogue stars above the horizon.
+
+    Brightness follows magnitude: the faint stars are single points, the
+    bright ones small discs with a soft halo. The horizon takes the low
+    ones, as the air does.
     """
     visibility = star_visibility(elev, cloud)
     if visibility <= 0:
         return None
-    tint = c.get("bright_foreground", (0.9, 0.92, 0.94))
-    r, g, b = (round(v * 255) for v in lighten(tint, 0.3))
-    rng = random.Random("skybg-celestial-catalog-v1")
-    catalog_size = max(100, int(4.3e-4 * width * height))
-    lat_r = math.radians(lat)
-    lst = local_sidereal_angle(t_utc, lon)
+    base = lighten(c.get("bright_foreground", (0.9, 0.92, 0.94)), 0.3)
+    cam, _, f, horizontal = camera(width, height, lat, t_utc, lon)
+    cx, cy = width / 2, height / 2
+    scale = width / 2560
+    # A small render (a preview panel) keeps only the brighter stars, so
+    # the sky stays a sky and not a grain.
+    limit = 6.5 - 2.5 * clamp((1600 - width) / 1400)
     lines = []
-    for _ in range(catalog_size):
-        ra = rng.uniform(0, 2 * math.pi)
-        dec = math.asin(rng.uniform(-1, 1))
-        brightness = rng.uniform(0.12, 0.54)
-        large = rng.random() < 0.10
-
-        hour_angle = lst - ra
-        sin_alt = (math.sin(lat_r) * math.sin(dec)
-                   + math.cos(lat_r) * math.cos(dec) * math.cos(hour_angle))
-        alt = math.asin(clamp(sin_alt, -1, 1))
+    for qx, qy, qz, mag, bv in load_stars():
+        if mag > limit:
+            break
+        q = (qx, qy, qz)
+        at = project(tuple(row[0] * qx + row[1] * qy + row[2] * qz for row in cam), f, cx, cy)
+        if at is None:
+            continue
+        x, y = at
+        if not (-2 <= x <= width + 2 and -2 <= y <= height + 2):
+            continue
+        alt = altitude_of(q, horizontal)
         if alt <= 0:
             continue
-        az = (math.atan2(math.sin(hour_angle),
-                         math.cos(hour_angle) * math.sin(lat_r)
-                         - math.tan(dec) * math.cos(lat_r)) + math.pi) % (2 * math.pi)
-
-        # A wide, south-facing projection preserves the intuitive east-left,
-        # west-right motion while allowing some northern sky at the edges.
-        south_offset = (math.degrees(az) - 180 + 180) % 360 - 180
-        if abs(south_offset) > 110:
+        t = clamp((6.5 - mag) / 8)
+        alpha = (0.30 + 0.70 * t ** 1.2) * visibility * smoothstep(0, 10, alt)
+        if alpha < 0.02:
             continue
-        x = width * (0.5 + south_offset / 220)
-        alt_deg = math.degrees(alt)
-        y = height * 0.82 * (1 - (alt_deg / 90) ** 0.75)
-        horizon_fade = smoothstep(0, 8, alt_deg)
-        edge_fade = 1 - smoothstep(92, 110, abs(south_offset))
-        alpha = brightness * visibility * horizon_fade * edge_fade * (0.6 + 0.4 * alt_deg / 90)
-        if alpha < 0.01:
-            continue
+        r, g, b = (round(v * 255) for v in star_tint(base, bv))
+        radius = max(0.45, (0.6 + 2.6 * t) * scale)
+        # The bright ones glow: a stack of wider, fainter discs.
+        if t > 0.45:
+            for spread, share in ((3.0, 0.06), (2.0, 0.12), (1.4, 0.3)):
+                lines.append(f"fill rgba({r},{g},{b},{alpha * share:.3f})")
+                lines.append(f"circle {x:.1f},{y:.1f} {x + radius * spread:.1f},{y:.1f}")
         lines.append(f"fill rgba({r},{g},{b},{alpha:.3f})")
-        if large:
-            lines.append(f"circle {x},{y} {x + 1},{y}")
-        else:
-            lines.append(f"point {x},{y}")
+        lines.append(f"circle {x:.1f},{y:.1f} {x + radius:.1f},{y:.1f}")
     return "\n".join(lines)
+
+
+MILKY_WAY_STRENGTH = 0.30   # the brightest of the band as light added over the sky
+MILKY_WAY_SCALE = 6         # the layer is rendered at this fraction of the screen
+
+
+def milky_way_ppm(width, height, elev, cloud, c, t_utc, lat, lon):
+    """A small RGB layer of the Milky Way to screen over the sky, or None
+    when it would not show. Each pixel looks along the camera into the
+    raster; the band thins toward the horizon and fades with twilight and
+    cloud faster than the stars do."""
+    visibility = milky_way_visibility(elev, cloud)
+    if visibility <= 0:
+        return None
+    raster = load_milky_way()
+    base = lighten(c.get("bright_foreground", (0.9, 0.92, 0.94)), 0.3)
+    milky = lerp(base, (0.78, 0.84, 1.0), 0.25)
+    gw, gh = max(16, width // MILKY_WAY_SCALE), max(10, height // MILKY_WAY_SCALE)
+    cam, inverse, f, horizontal = camera(width, height, lat, t_utc, lon)
+    cx, cy = width / 2, height / 2
+    step = width / gw
+    up_row = horizontal[2]
+    mw_w, mw_h = MILKY_WAY_W, MILKY_WAY_H
+    strength = MILKY_WAY_STRENGTH * visibility
+    out = bytearray()
+    for gy in range(gh):
+        py = (gy + 0.5) * step
+        for gx in range(gw):
+            x, y, z = unproject((gx + 0.5) * step, py, f, cx, cy)
+            q = tuple(row[0] * x + row[1] * y + row[2] * z for row in inverse)
+            sin_alt = up_row[0] * q[0] + up_row[1] * q[1] + up_row[2] * q[2]
+            if sin_alt <= 0:
+                out += b"\0\0\0"
+                continue
+            ra = math.degrees(math.atan2(q[1], q[0]))
+            dec = math.degrees(math.asin(clamp(q[2], -1, 1)))
+            col = (mw_w / 2 - ra * mw_w / 360) % mw_w
+            row = min(mw_h - 1.001, (90 - dec) * mw_h / 180)
+            c0, r0 = int(col), int(row)
+            fc, fr = col - c0, row - r0
+            c1 = (c0 + 1) % mw_w
+            top = raster[r0 * mw_w + c0] * (1 - fc) + raster[r0 * mw_w + c1] * fc
+            bottom = raster[(r0 + 1) * mw_w + c0] * (1 - fc) + raster[(r0 + 1) * mw_w + c1] * fc
+            level = (top * (1 - fr) + bottom * fr) / 255
+            level *= strength * min(1.0, math.degrees(math.asin(sin_alt)) / 14)
+            out += bytes(round(clamp(v * level) * 255) for v in milky)
+    return f"P6\n{gw} {gh}\n255\n".encode() + bytes(out)
 
 
 # ---------- rendering ----------
@@ -567,8 +735,15 @@ def render_sky(out_path, width, height, t_utc, lat, lon, cloud, fog, colors):
             for color in row:
                 f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in color)))
 
-    cmd = [which("magick"), ppm_path, "-resize", f"{width}x{height}!",
-           "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8"]
+    cmd = [which("magick"), ppm_path, "-resize", f"{width}x{height}!"]
+    milk = milky_way_ppm(width, height, elev, cloud, colors, t_utc, lat, lon)
+    if milk:
+        milk_path = os.path.join(STATE_DIR, "milkyway.ppm")
+        with open(milk_path, "wb") as f:
+            f.write(milk)
+        cmd += ["(", milk_path, "-resize", f"{width}x{height}!", ")",
+                "-compose", "Screen", "-composite"]
+    cmd += ["-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8"]
     mvg = star_mvg(width, height, elev, cloud, colors, t_utc, lat, lon)
     if mvg:
         mvg_path = os.path.join(STATE_DIR, "stars.mvg")
@@ -770,6 +945,10 @@ def doctor():
         for unit in ("skybg.service", "skybg.timer"):
             checks.append((unit, os.path.isfile(os.path.join(unit_dir, unit)),
                            "installed user unit"))
+    try:
+        checks.append(("sky data", True, data_dir()))
+    except SkybgError as exc:
+        checks.append(("sky data", False, str(exc)))
     try:
         lat, lon = get_location()
         checks.append(("location", True, f"{lat:.4f}, {lon:.4f}"))

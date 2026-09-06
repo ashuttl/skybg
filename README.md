@@ -8,7 +8,8 @@
 elevation and azimuth, and current cloud cover. A soft glow crosses the screen
 from east to west, the horizon warming under the sun and holding the mauve of
 the Earth's shadow opposite it; cloud and fog flatten the sky; clear nights
-reveal a fixed celestial sphere that turns with sidereal time.
+reveal the real sky — the Yale Bright Star Catalogue and the Milky Way,
+projected for your location and the hour, turning with sidereal time.
 
 It is built for Omarchy Quattro. Change themes and the sky retints itself.
 Choose another background and `skybg` bows out after confirming the change.
@@ -85,7 +86,9 @@ all weather requests with:
 skybg config weather off
 ```
 
-Solar position and stars are calculated locally.
+Solar position, the stars and the Milky Way are calculated locally. The star
+catalogue and the Milky Way raster are bundled (see `data/SOURCES.md` for their
+sources and licences) and are never fetched at run time.
 
 ## Omarchy integration
 
