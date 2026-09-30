@@ -243,6 +243,43 @@ class WeatherTests(unittest.TestCase):
             self.assertEqual(self._get_weather(directory, 33.5, 36.2), (1.0, False))
 
 
+class BackgroundTests(unittest.TestCase):
+    def _generate(self, directory, current):
+        def render(out_path, *args):
+            open(out_path, "w").close()
+            return 0.0, 0.0
+        with mock.patch.object(skybg, "STATE_DIR", directory), \
+                mock.patch.object(skybg, "get_location", return_value=(43.677, -70.371)), \
+                mock.patch.object(skybg, "get_weather", return_value=(0.0, False)), \
+                mock.patch.object(skybg, "screen_size", return_value=(10, 10)), \
+                mock.patch.object(skybg, "theme_colors", return_value={}), \
+                mock.patch.object(skybg, "current_background", return_value=current), \
+                mock.patch.object(skybg, "render_sky", side_effect=render), \
+                mock.patch.object(skybg, "set_background") as set_background:
+            skybg.generate_and_set()
+        return set_background.call_args.args[0]
+
+    def test_every_render_gets_a_new_name(self):
+        # macOS reuses its decoded image for a path another Space still shows,
+        # so no render may reuse the name of an earlier one.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            first = self._generate(directory, "")
+            second = self._generate(directory, first)
+            third = self._generate(directory, second)
+            self.assertEqual(len({first, second, third}), 3)
+
+    def test_old_renders_are_pruned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            for name in ("sky-a.png", "sky-b.png", "stars.mvg"):
+                open(os.path.join(directory, name), "w").close()
+            current = os.path.join(directory, "sky-b.png")
+            new = self._generate(directory, current)
+            self.assertEqual(sorted(os.listdir(directory)),
+                             sorted([os.path.basename(new), "sky-b.png", "stars.mvg", "render.lock"]))
+
+
 class ConfigAndCliTests(unittest.TestCase):
     def test_explicit_location(self):
         with mock.patch.object(skybg, "load_config", return_value={"location": [1.5, -2.5]}):

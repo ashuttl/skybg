@@ -786,16 +786,30 @@ def generate_and_set():
         cloud, fog = get_weather(lat, lon)
         width, height = screen_size()
 
-        # Alternate names so background watchers (Quattro's, or macOS's
-        # path-keyed wallpaper cache) see a new target.
-        out_path = os.path.join(
-            STATE_DIR, "sky-b.png" if current_background().endswith("sky-a.png") else "sky-a.png")
+        # A new name for every render: background watchers key on the path.
+        # Quattro watches the symlink target, and macOS's wallpaper agent
+        # reuses the image it already decoded for a path while any other Space
+        # still shows that path — so alternating two names brought back a
+        # render from hours earlier on every other tick.
+        previous = current_background()
+        out_path = os.path.join(STATE_DIR, f"sky-{time.time_ns()}.png")
 
         elev, az = render_sky(out_path, width, height,
                               datetime.datetime.now(datetime.timezone.utc),
                               lat, lon, cloud, fog, theme_colors())
         set_background(out_path)
+        prune_renders(keep={os.path.realpath(out_path), previous})
     return elev, cloud, fog
+
+
+def prune_renders(keep):
+    """Delete old renders, keeping `keep`: the new one, and the one it
+    replaces, which may still be mid-transition."""
+    for name in os.listdir(STATE_DIR):
+        path = os.path.join(STATE_DIR, name)
+        if name.startswith("sky-") and name.endswith(".png") and os.path.realpath(path) not in keep:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
 
 
 def montage_font():

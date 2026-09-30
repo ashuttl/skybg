@@ -23,6 +23,10 @@
   whole cycle out.
 - Key the weather cache by location, so changing location no longer serves the
   previous location's weather until the TTL expires.
+- Give every render its own file name and prune old ones. On macOS, when
+  another Space still showed one of the two alternating names, the wallpaper
+  agent reused the image it had decoded hours earlier, so every other tick put
+  back a stale sky — daylight at night.
 
 ## 0.1.0 — 2026-08-16
 
