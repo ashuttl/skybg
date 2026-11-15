@@ -13,6 +13,19 @@ Theme-independent: switch themes and the sky re-tints.
   the Milky Way, projected for the place and the hour, rising in the east
   and setting in the west as sidereal time advances.
 
+A second style, "daylight", is a port of Pond's Daylight wallpaper: a quiet
+six-band gradient from a fixed palette, paced by the day's real sunrise and
+sunset. It ignores the theme and the weather.
+
+A third, "bokashi", is a woodblock-print sky: a band of ink wiped down from
+the top edge, a flat ground, a band of colour at the horizon, a flat red sun
+where the sun is, and the moon in its phase, in inks tinted by the theme.
+
+A fourth, "cyanotype", charts the sky instead of painting it: white on
+Prussian blue, the sun's path for today as a wave over and under a ruled
+horizon, with the solstice and equinox paths behind it; the blue is the
+theme's. Choose with `skybg config style`.
+
 Commands:
   skybg on             generate + set the background, and start the 5-minute timer
   skybg off            stop the timer (background stays until you change it)
@@ -23,7 +36,7 @@ Commands:
   skybg doctor         check dependencies, location, theme, and installed units
   skybg preview [N]    render a 24-hour montage to ~/Pictures/skybg-day-preview.png,
                        at N% cloud cover (default: live weather)
-  skybg config ...     set location and weather behavior
+  skybg config ...     set location, weather behavior, and style
 """
 
 import datetime
@@ -57,6 +70,7 @@ WEATHER_CACHE = os.path.join(STATE_DIR, "weather.json")
 FOREIGN_MARKER = os.path.join(STATE_DIR, "foreign-seen")
 WEATHER_TTL = 1200  # seconds
 FOG_CODES = {45, 48}
+STYLES = ("sky", "daylight", "bokashi", "cyanotype")
 
 
 class SkybgError(Exception):
@@ -68,11 +82,15 @@ def load_config():
         with open(CONFIG_FILE) as f:
             data = json.load(f)
     except FileNotFoundError:
-        return {"location": "auto", "weather": True}
+        return {"location": "auto", "weather": True, "style": "sky"}
     except (OSError, ValueError) as exc:
         raise SkybgError(f"could not read {CONFIG_FILE}: {exc}") from exc
     data.setdefault("location", "auto")
     data.setdefault("weather", True)
+    data.setdefault("style", "sky")
+    if data["style"] not in STYLES:
+        raise SkybgError(f"unknown style {data['style']!r} in {CONFIG_FILE}; "
+                         f"run 'skybg config style {'|'.join(STYLES)}'")
     return data
 
 
@@ -83,6 +101,10 @@ def save_config(config):
         json.dump(config, f, indent=2)
         f.write("\n")
     os.replace(temporary, CONFIG_FILE)
+
+
+def current_style():
+    return load_config().get("style", "sky")
 
 
 @contextlib.contextmanager
@@ -149,9 +171,13 @@ def get_location():
 
 # ---------- weather ----------
 
+def uses_weather():
+    return load_config()["weather"] and current_style() == "sky"
+
+
 def get_weather(lat, lon):
     """Returns (cloud_fraction 0..1, is_fog). Cached; degrades to last-known, then 0.3."""
-    if not load_config()["weather"]:
+    if not uses_weather():
         return 0.0, False
     try:
         with open(WEATHER_CACHE) as f:
@@ -694,6 +720,626 @@ def milky_way_ppm(width, height, elev, cloud, c, t_utc, lat, lon):
 
 # ---------- rendering ----------
 
+# ---------- daylight style ----------
+#
+# A port of the Daylight wallpaper from Pond (pond-wallpaper 0.2.0: SkyState.js
+# and sky.frag). Copyright (c) 2026, Butterfly Interaction Inc. BSD-3-Clause;
+# the full notice is in LICENSES/pond-wallpaper.txt. The palette, the
+# interpolation and the tone curve are Pond's. What is skybg's: sunrise and
+# sunset come from the sun at the configured location rather than a fixed
+# 6:30 and 18:30, and the picture is rendered to a file instead of a shader.
+
+DAYLIGHT = {"brightness": 0.65, "saturation": 0.70, "warmth": 0.012,
+            "horizon": 0.84, "twilight": 1.95, "sunrise": 6.5, "sunset": 18.5}
+DAYLIGHT_SUNRISE_LIMITS = (4.0, 9.0)
+DAYLIGHT_SUNSET_LIMITS = (15.0, 22.0)
+DAYLIGHT_MAX_CHROMA = 0.085
+SUN_RISE_ELEVATION = -0.833   # the upper limb on the horizon, with refraction
+
+
+def srgb_to_oklab(rgb):
+    """Oklab (Björn Ottosson, public domain) from gamma-encoded sRGB."""
+    r, g, b = (v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in rgb)
+    l = math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+    m = math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+    s = math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+
+def oklab_to_srgb(lab):
+    """Gamma-encoded sRGB from Oklab; out-of-gamut colours leave 0..1."""
+    L, a, b = lab
+    l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+    m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+    s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+    linear = (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+              -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+              -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+    return tuple(12.92 * v if v < 0.0031308 else 1.055 * max(v, 0.0) ** (1 / 2.4) - 0.055
+                 for v in linear)
+
+
+# Each anchor is an hour of the palette's own day (sunrise 6.5, sunset 18.5)
+# and six bands down the screen: zenith, upper sky, middle sky, haze, horizon,
+# lower edge. A row is the six band positions, then the six colours in Oklab.
+DAYLIGHT_ANCHORS = [
+    (hour, positions + [v for color in colors for v in srgb_to_oklab(hexrgb(color))])
+    for hour, positions, colors in [
+        (0, [0, .33, .59, .78, .90, 1], ["080b16", "0d1220", "141d2d", "1c2939", "26313e", "1b2331"]),
+        (3, [0, .40, .64, .80, .92, 1], ["090d1b", "111a2b", "21324a", "334958", "514c50", "262c3b"]),
+        (4.8, [0, .355, .61, .79, .91, 1], ["172036", "2d3e56", "515c6d", "796d76", "a3797e", "504e62"]),
+        (6.5, [0, .28, .515, .74, .905, 1], ["2e3b52", "4c596d", "76757f", "a6868f", "bf948a", "87717a"]),
+        (8.5, [0, .25, .49, .73, .905, 1], ["405368", "5b6c7c", "7e888e", "a39b9b", "bca4a0", "a99193"]),
+        (12, [0, .25, .52, .75, .93, 1], ["4d697b", "617d8b", "7a929c", "94a4a7", "b3b1bc", "aba8b2"]),
+        (15, [0, .27, .52, .76, .93, 1], ["4e6575", "687d88", "879698", "aba3a8", "bdaba3", "ad9795"]),
+        (17.3, [0, .25, .49, .73, .905, 1], ["405368", "5b6c7c", "7e888e", "a39b9b", "bca4a0", "a99193"]),
+        (18.5, [0, .28, .515, .74, .905, 1], ["2e3b52", "4c596d", "76757f", "a6868f", "bf948a", "87717a"]),
+        (19.6, [0, .355, .61, .79, .91, 1], ["172036", "2d3e56", "515c6d", "796d76", "a3797e", "504e62"]),
+        (21, [0, .38, .63, .81, .93, 1], ["0f1529", "1c2942", "2e4059", "475369", "62586b", "2d334b"]),
+        (23, [0, .35, .60, .80, .92, 1], ["090d1b", "10192a", "1b2b3f", "293b4e", "3d4655", "232d3e"]),
+    ]
+]
+# The palette hours of: twilight's start, sunrise, full morning, the start of
+# evening, sunset, twilight's end.
+DAYLIGHT_PALETTE_TIMES = [4.8, 6.5, 8.5, 17.3, 18.5, 19.6]
+
+
+def pchip_slope(d0, d1, h0, h1):
+    """Shape-preserving tangent between two secants: no overshoot."""
+    if d0 * d1 <= 0:
+        return 0.0
+    w1, w2 = 2 * h1 + h0, h1 + 2 * h0
+    return (w1 + w2) / (w1 / d0 + w2 / d1)
+
+
+def hermite(y0, y1, m0, m1, h, u):
+    return ((2 * u ** 3 - 3 * u * u + 1) * y0 + (u ** 3 - 2 * u * u + u) * h * m0
+            + (-2 * u ** 3 + 3 * u * u) * y1 + (u ** 3 - u * u) * h * m1)
+
+
+def periodic_knots(xs, x):
+    """The four knots around `x` on a 24-hour circle, as (index, hour) pairs
+    whose hours run on past 0 and 24 where the circle wraps."""
+    count = len(xs)
+    following = next((k for k, value in enumerate(xs) if value > x), count)
+    i = following - 1
+    return [(k % count, xs[k % count] + (-24 if k < 0 else 24 if k >= count else 0))
+            for k in (i - 1, i, i + 1, i + 2)]
+
+
+def daylight_palette_hour(hour, sunrise, sunset, twilight=DAYLIGHT["twilight"]):
+    """Map a clock hour onto the palette's day, so that its sunrise and sunset
+    fall on the real ones, continuously through midnight."""
+    twilight = min(twilight, (24 - sunset + sunrise) / 3)
+    times = [sunrise - twilight, sunrise, sunrise + twilight,
+             sunset - twilight, sunset, sunset + twilight]
+    hour %= 24
+    if hour < times[0]:
+        hour += 24
+    (ia, xa), (ib, xb), (ic, xc), (id_, xd) = periodic_knots(times, hour)
+    ya, yb, yc, yd = (DAYLIGHT_PALETTE_TIMES[i] + round((x - times[i]) / 24) * 24
+                      for i, x in ((ia, xa), (ib, xb), (ic, xc), (id_, xd)))
+    h0, h, h2 = xb - xa, xc - xb, xd - xc
+    d0, d1, d2 = (yb - ya) / h0, (yc - yb) / h, (yd - yc) / h2
+    return hermite(yb, yc, pchip_slope(d0, d1, h0, h), pchip_slope(d1, d2, h, h2),
+                   h, (hour - xb) / h) % 24
+
+
+def daylight_stops(hour, sunrise=DAYLIGHT["sunrise"], sunset=DAYLIGHT["sunset"]):
+    """Six (position, Oklab colour) bands for a clock hour."""
+    sunrise = clamp(sunrise, *DAYLIGHT_SUNRISE_LIMITS)
+    sunset = clamp(sunset, *DAYLIGHT_SUNSET_LIMITS)
+    palette_hour = daylight_palette_hour(hour, sunrise, sunset)
+    (ia, xa), (ib, xb), (ic, xc), (id_, xd) = periodic_knots(
+        [anchor_hour for anchor_hour, _ in DAYLIGHT_ANCHORS], palette_hour)
+    a, b, c, d = (DAYLIGHT_ANCHORS[i][1] for i in (ia, ib, ic, id_))
+    h0, h, h2 = xb - xa, xc - xb, xd - xc
+    u = (palette_hour - xb) / h
+    values = []
+    for k in range(len(b)):
+        d0, d1, d2 = (b[k] - a[k]) / h0, (c[k] - b[k]) / h, (d[k] - c[k]) / h2
+        values.append(hermite(b[k], c[k], pchip_slope(d0, d1, h0, h),
+                              pchip_slope(d1, d2, h, h2), h, u))
+    bend = math.log(DAYLIGHT["horizon"]) / math.log(0.9)
+    return [(clamp(values[i]) ** bend, tuple(values[6 + 3 * i:9 + 3 * i])) for i in range(6)]
+
+
+def daylight_color(stops, y):
+    """sRGB at height `y` (0 top, 1 bottom): interpolate the bands, then
+    Pond's tone curve, saturation, warmth and gamut fit."""
+    i = max((j for j in range(1, 5) if y >= stops[j][0]), default=0)
+    (pa, a), (pb, b), (pc, c), (pd, d) = (stops[max(i - 1, 0)], stops[i], stops[i + 1],
+                                          stops[min(i + 2, 5)])
+    h0, h, h2 = pb - pa, pc - pb, pd - pc
+    u = (y - pb) / h
+    lab = []
+    for k in range(3):
+        d1 = (c[k] - b[k]) / h
+        m0 = pchip_slope((b[k] - a[k]) / h0, d1, h0, h) if h0 > 0 else d1
+        m1 = pchip_slope(d1, (d[k] - c[k]) / h2, h, h2) if h2 > 0 else d1
+        lab.append(hermite(b[k], c[k], m0, m1, h, u))
+    lightness = DAYLIGHT["brightness"] * math.tanh(lab[0] / 0.75)
+    ca = lab[1] * DAYLIGHT["saturation"]
+    cb = lab[2] * DAYLIGHT["saturation"] + DAYLIGHT["warmth"] * lightness
+    chroma = math.hypot(ca, cb)
+    if chroma > DAYLIGHT_MAX_CHROMA:
+        ca, cb = ca * DAYLIGHT_MAX_CHROMA / chroma, cb * DAYLIGHT_MAX_CHROMA / chroma
+    color = oklab_to_srgb((lightness, ca, cb))
+    for _ in range(16):
+        if all(0 <= v <= 1 for v in color):
+            break
+        ca, cb = ca * 0.85, cb * 0.85
+        color = oklab_to_srgb((lightness, ca, cb))
+    return color
+
+
+def sun_times(lat, lon, local_day):
+    """Clock hours of sunrise and sunset on the day of `local_day` (an aware
+    datetime), or Pond's 6.5 and 18.5 where the sun does not rise or set."""
+    midnight = local_day.replace(hour=0, minute=0, second=0, microsecond=0)
+    above = [solar_position(lat, lon, (midnight + datetime.timedelta(minutes=minute))
+                            .astimezone(datetime.timezone.utc))[0] > SUN_RISE_ELEVATION
+             for minute in range(0, 24 * 60, 2)]
+    rises = [k for k in range(1, len(above)) if above[k] and not above[k - 1]]
+    sets = [k for k in range(1, len(above)) if above[k - 1] and not above[k]]
+    if not rises or not sets:
+        return DAYLIGHT["sunrise"], DAYLIGHT["sunset"]
+    return rises[0] / 30, sets[-1] / 30
+
+
+def render_daylight(out_path, width, height, t_utc, lat, lon):
+    local = t_utc.astimezone()
+    hour = local.hour + local.minute / 60 + local.second / 3600
+    stops = daylight_stops(hour, *sun_times(lat, lon, local))
+    # The picture varies only down the screen: one column, stretched across.
+    ppm_path = os.path.join(STATE_DIR, "daylight.ppm")
+    with open(ppm_path, "wb") as f:
+        f.write(f"P6\n1 {height}\n65535\n".encode())
+        for row in range(height):
+            color = daylight_color(stops, (row + 0.5) / height)
+            f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in color)))
+    temporary = out_path + ".tmp.png"
+    subprocess.run([which("magick"), ppm_path, "-scale", f"{width}x{height}!",
+                    "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8", temporary],
+                   check=True, timeout=60)
+    os.replace(temporary, out_path)
+
+
+# ---------- theme inks ----------
+#
+# The printed styles are drawn in fixed inks, chosen by hand, and then taken
+# into the theme. A theme's colours are picked to be read as text, not to
+# fill a screen, so they are not used as they are: each ink keeps its own
+# lightness, turns to the hue of the theme colour that stands for its
+# pigment, and loses chroma where the theme has less. The sheet itself — the
+# pale inks of a light theme, the dark inks of a dark one — moves onto the
+# theme's background.
+
+THEME_INKS = 1.0   # how far the inks go into the theme; 0 leaves them as printed
+# The print's pigments: pink, vermilion, ochre, pale sky, Prussian blue.
+INK_PIGMENTS = {"pink": "e8809a", "red": "d9532f", "ochre": "f0b97a",
+                "sky": "9cc2d4", "blue": "2c66ae"}
+LIGHT_THEME = 0.4  # background luminance at and above which a theme is light
+
+
+def is_light(colors):
+    return gray_of(colors["background"])[0] >= LIGHT_THEME
+
+
+def oklab_hue(lab):
+    return math.degrees(math.atan2(lab[2], lab[1])) % 360
+
+
+def theme_tint(c, paper, night):
+    """A function taking a printed ink (Oklab) into the theme `c`. `paper`
+    and `night` are the hex colours of the style's own light and dark sheet,
+    which land on the theme's background."""
+    stand_ins = {"pink": lerp(c["magenta"], c["red"], 0.3), "red": c["red"],
+                 "ochre": lerp(c["orange"], c["yellow"], 0.5),
+                 "sky": lerp(c["blue"], c["cyan"], 0.6), "blue": c["blue"]}
+    anchors = []
+    for name, pigment in INK_PIGMENTS.items():
+        printed, themed = srgb_to_oklab(hexrgb(pigment)), srgb_to_oklab(stand_ins[name])
+        chroma = math.hypot(themed[1], themed[2])
+        # A grey has no hue to turn to; it only drains the ink.
+        turn = (oklab_hue(themed) - oklab_hue(printed) + 180) % 360 - 180 if chroma > 0.02 else 0.0
+        anchors.append((oklab_hue(printed), turn,
+                        min(1.0, chroma / math.hypot(printed[1], printed[2]))))
+    anchors.sort()
+    light = is_light(c)
+    sheet = srgb_to_oklab(hexrgb(paper if light else night))
+    move = tuple(b - s for b, s in zip(srgb_to_oklab(c["background"]), sheet))
+
+    def tint(lab):
+        lightness, a, b = lab
+        hue = oklab_hue(lab)
+        after = next((k for k, anchor in enumerate(anchors) if anchor[0] > hue), 0)
+        (h0, turn0, keep0), (h1, turn1, keep1) = anchors[after - 1], anchors[after]
+        u = ((hue - h0) % 360) / ((h1 - h0) % 360)
+        on_sheet = THEME_INKS * (smoothstep(0.60, 0.90, lightness) if light
+                                 else smoothstep(0.50, 0.25, lightness))
+        inked = THEME_INKS * (1 - on_sheet)
+        chroma = math.hypot(a, b) * (1 + (keep0 + (keep1 - keep0) * u - 1) * inked)
+        hue = math.radians(hue + (turn0 + (turn1 - turn0) * u) * inked)
+        return (lightness + on_sheet * move[0], chroma * math.cos(hue) + on_sheet * move[1],
+                chroma * math.sin(hue) + on_sheet * move[2])
+    return tint
+
+
+# ---------- bokashi style ----------
+#
+# A sky the way a woodblock print makes one. Bokashi is the printer's wiped
+# gradation: a deep band of ink along the top edge, a flat ground, and a band
+# of colour rising from the horizon. On that sits a flat sun, where the sun
+# is from here, and by night the moon, in its phase and leaning toward the
+# sun. The inks below are the print's own; the theme chooses the stock and
+# then tints them (see theme inks, above).
+
+# Sun elevation, then the inks: top band, ground, glow above the horizon, the
+# horizon itself; then how far down the top band reaches and how far up the
+# horizon band does, as fractions of the sheet. Dawn is pink, dusk is red.
+BOKASHI_TWILIGHT = {
+    "dusk": [
+        (-18, "0d1020", "1a2238", "27324a", "303c52", 0.50, 0.40),
+        (-9, "111a38", "26365a", "4a4c72", "7a5a78", 0.50, 0.42),
+        (-3, "1b2c5c", "50608c", "d08a8a", "c8553d", 0.46, 0.46),
+        (0.5, "24468a", "a9a3b8", "f0b97a", "d9532f", 0.40, 0.50),
+    ],
+    "dawn": [
+        (-18, "0d1020", "1a2238", "27324a", "303c52", 0.50, 0.40),
+        (-9, "111a38", "26365a", "4c5078", "80648a", 0.50, 0.42),
+        (-3, "1b2c5c", "56668f", "e0a0b0", "d0708a", 0.46, 0.46),
+        (0.5, "24468a", "b0aabd", "f6c9b0", "e8809a", 0.40, 0.50),
+    ],
+}
+# By day the sheet shows its stock. Under a light theme it is natural paper:
+# the sky is the bare sheet between a blue band and a pale horizon. Under a
+# dark theme it is indigo-dyed: the sky is printed blue and the horizon pale.
+BOKASHI_DAY = {
+    "paper": {
+        "dusk": [(7, "2a5aa0", "e3d6c6", "f4d49a", "eaa27e", 0.34, 0.42)],
+        "dawn": [(7, "2a5aa0", "e6dace", "f6dcc0", "f0b6b0", 0.34, 0.42)],
+        "high": [(22, "2c66ae", "ece6d6", "ebe8d8", "d5e2dc", 0.30, 0.30),
+                 (60, "2c66ae", "efeadc", "eceadc", "d2e3e0", 0.28, 0.26)],
+    },
+    "indigo": {
+        "dusk": [(7, "244c90", "7d8fb2", "f1c58f", "e9966f", 0.38, 0.44)],
+        "dawn": [(7, "244c90", "8192b6", "f3c9b6", "eda3a8", 0.38, 0.44)],
+        "high": [(22, "1f4f98", "5f8abb", "a8c6d2", "e4e3cf", 0.36, 0.36),
+                 (60, "1d4c96", "5587bd", "9cc2d4", "dfe5d6", 0.36, 0.32)],
+    },
+}
+BOKASHI_SUN_LOW, BOKASHI_SUN_HIGH = "d6402b", "e8694a"
+BOKASHI_MOON = "f1ead6"
+BOKASHI_SUN_RADIUS = 0.060    # of the sheet's height
+BOKASHI_MOON_RADIUS = 0.042
+BOKASHI_ALT_TOP = 75.0        # altitude at the top edge; the bottom edge is the horizon
+BOKASHI_INDIGO_DEPTH = 0.90   # lightness of the indigo sheet, against dark windows
+BOKASHI_DAY_MOON = 0.5        # how much of the moon shows while the sun is up
+BOKASHI_SHEETS = ("ece6d6", "1a2238")   # the paper, and the ground at night
+
+
+def moon_position(lat, lon, t_utc):
+    """(altitude, azimuth-from-north, illuminated fraction, waxing) of the
+    moon. Low-precision series, good to a fraction of a degree."""
+    days = t_utc.timestamp() / 86400 + 2440587.5 - 2451545.0
+    t = days / 36525
+    sin, cos, rad = (lambda d: math.sin(math.radians(d))), (lambda d: math.cos(math.radians(d))), math.radians
+    lam = (218.32 + 481267.881 * t + 6.29 * sin(135.0 + 477198.87 * t)
+           - 1.27 * sin(259.3 - 413335.36 * t) + 0.66 * sin(235.7 + 890534.22 * t)
+           + 0.21 * sin(269.9 + 954397.74 * t) - 0.19 * sin(357.5 + 35999.05 * t)
+           - 0.11 * sin(186.5 + 966404.03 * t))
+    beta = (5.13 * sin(93.3 + 483202.02 * t) + 0.28 * sin(228.2 + 960400.89 * t)
+            - 0.28 * sin(318.3 + 6003.15 * t) - 0.17 * sin(217.6 - 407332.21 * t))
+    tilt = 23.439 - 0.0000004 * days
+    x = cos(beta) * cos(lam)
+    y = cos(tilt) * cos(beta) * sin(lam) - sin(tilt) * sin(beta)
+    z = sin(tilt) * cos(beta) * sin(lam) + cos(tilt) * sin(beta)
+    hour_angle = local_sidereal_angle(t_utc, lon) - math.atan2(y, x)
+    dec, lat_r = math.asin(z), rad(lat)
+    alt = math.degrees(math.asin(clamp(math.sin(lat_r) * math.sin(dec)
+                                       + math.cos(lat_r) * math.cos(dec) * math.cos(hour_angle),
+                                       -1.0, 1.0)))
+    alt -= 0.95 * cos(alt)   # the moon is near enough for parallax to lower it
+    az = math.degrees(math.atan2(
+        math.sin(hour_angle),
+        math.cos(hour_angle) * math.sin(lat_r) - math.tan(dec) * math.cos(lat_r)))
+    anomaly = 357.528 + 0.9856003 * days
+    sun = 280.460 + 0.9856474 * days + 1.915 * sin(anomaly) + 0.020 * sin(2 * anomaly)
+    elongation = (lam - sun) % 360
+    return alt, (az + 180) % 360, (1 - cos(elongation)) / 2, elongation < 180
+
+
+def bokashi_inks(elev, morning, stock="paper"):
+    """The four inks (Oklab) and two band extents for a sun elevation."""
+    half = "dawn" if morning else "dusk"
+    keys = BOKASHI_TWILIGHT[half] + BOKASHI_DAY[stock][half] + BOKASHI_DAY[stock]["high"]
+    elev = clamp(elev, keys[0][0], keys[-1][0])
+    k = max(i for i in range(len(keys) - 1) if elev >= keys[i][0])
+    low, high = keys[k], keys[k + 1]
+    t = smoothstep(low[0], high[0], elev)
+    inks = [lerp(srgb_to_oklab(hexrgb(low[i])), srgb_to_oklab(hexrgb(high[i])), t)
+            for i in range(1, 5)]
+    return inks, low[5] + (high[5] - low[5]) * t, low[6] + (high[6] - low[6]) * t
+
+
+def bokashi_color(inks, top_reach, horizon_reach, y):
+    """Oklab at height `y` (0 top, 1 bottom): each band wiped into the ground."""
+    top, ground, glow, horizon = inks
+    stops = [(0.0, top), (top_reach, ground), (1 - horizon_reach, ground),
+             (1 - 0.42 * horizon_reach, glow), (1.0, horizon)]
+    for (y0, c0), (y1, c1) in zip(stops, stops[1:]):
+        if y <= y1:
+            return lerp(c0, c1, smoothstep(y0, y1, y))
+    return horizon
+
+
+def bokashi_screen(az, alt, lat):
+    """Where a bearing and altitude fall on the sheet, as fractions of its
+    width and height. The sheet faces the sun's side of the sky: south in the
+    northern hemisphere, north in the southern; the bottom edge is the horizon."""
+    if lat >= 0:
+        x = 0.5 + (az - 180) / AZ_SPAN
+    else:
+        x = 0.5 + ((az + 180) % 360 - 180) / AZ_SPAN
+    return x, 1 - alt / BOKASHI_ALT_TOP
+
+
+def moon_outline(cx, cy, radius, fraction, toward):
+    """The lit part of the moon as polygon points: the limb on the side
+    facing `toward` (radians, screen angle), closed by the terminator."""
+    points = []
+    steps = 48
+    for k in range(steps + 1):
+        a = -math.pi / 2 + math.pi * k / steps
+        points.append((radius * math.cos(a), radius * math.sin(a)))
+    for k in range(steps + 1):
+        a = math.pi / 2 - math.pi * k / steps
+        points.append((radius * math.cos(a) * (1 - 2 * fraction), radius * math.sin(a)))
+    c, s = math.cos(toward), math.sin(toward)
+    return [(cx + x * c - y * s, cy + x * s + y * c) for x, y in points]
+
+
+def render_bokashi(out_path, width, height, t_utc, lat, lon, colors):
+    elev, az = solar_position(lat, lon, t_utc)
+    stock = "paper" if is_light(colors) else "indigo"
+    inks, top_reach, horizon_reach = bokashi_inks(elev, az < 180, stock)
+    depth = BOKASHI_INDIGO_DEPTH if stock == "indigo" else 1.0
+    tint = theme_tint(colors, *BOKASHI_SHEETS)
+
+    def paint(lab):
+        return oklab_to_srgb(tint((lab[0] * depth, lab[1], lab[2])))
+
+    def rgba(hexcolor, alpha):
+        r, g, b = (round(clamp(v) * 255) for v in paint(srgb_to_oklab(hexrgb(hexcolor))))
+        return f"rgba({r},{g},{b},{alpha:.3f})"
+
+    sheet = os.path.join(STATE_DIR, "bokashi.ppm")
+    with open(sheet, "wb") as f:
+        f.write(f"P6\n1 {height}\n65535\n".encode())
+        for row in range(height):
+            color = paint(bokashi_color(inks, top_reach, horizon_reach, (row + 0.5) / height))
+            f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in color)))
+    # The sun and moon sink into the horizon band rather than being cut by the edge.
+    mist = os.path.join(STATE_DIR, "bokashi-mist.pgm")
+    with open(mist, "wb") as f:
+        f.write(f"P5\n1 {height}\n65535\n".encode())
+        for row in range(height):
+            f.write(struct.pack(">H", round(smoothstep(1.0, 0.86, (row + 0.5) / height) * 65535)))
+
+    draw = []
+    sun_x, sun_y = bokashi_screen(az, elev, lat)
+    radius = BOKASHI_SUN_RADIUS * height
+    if sun_y * height - radius < height:
+        ink = lerp(hexrgb(BOKASHI_SUN_LOW), hexrgb(BOKASHI_SUN_HIGH), smoothstep(0, 40, elev))
+        ink = "".join(f"{round(v * 255):02x}" for v in ink)
+        cx, cy = sun_x * width, sun_y * height
+        draw += ["-fill", rgba(ink, 1.0), "-draw", f"circle {cx:.1f},{cy:.1f} {cx + radius:.1f},{cy:.1f}"]
+    moon_alt, moon_az, fraction, _ = moon_position(lat, lon, t_utc)
+    moon_x, moon_y = bokashi_screen(moon_az, moon_alt, lat)
+    radius = BOKASHI_MOON_RADIUS * height
+    shown = max(smoothstep(8, -4, elev), BOKASHI_DAY_MOON)
+    if shown > 0 and moon_y * height - radius < height:
+        cx, cy = moon_x * width, moon_y * height
+        toward = math.atan2((sun_y - moon_y) * height, (sun_x - moon_x) * width)
+        outline = " ".join(f"{x:.1f},{y:.1f}" for x, y in moon_outline(cx, cy, radius, fraction, toward))
+        draw += ["-fill", rgba(BOKASHI_MOON, 0.10 * shown),
+                 "-draw", f"circle {cx:.1f},{cy:.1f} {cx + radius:.1f},{cy:.1f}",
+                 "-fill", rgba(BOKASHI_MOON, 0.95 * shown), "-draw", f"polygon {outline}"]
+
+    cmd = [which("magick"), sheet, "-scale", f"{width}x{height}!"]
+    if draw:
+        cmd += ["(", "-size", f"{width}x{height}", "xc:none", *draw,
+                "(", mist, "-scale", f"{width}x{height}!", "-alpha", "copy", ")",
+                "-compose", "DstIn", "-composite", ")", "-compose", "Over", "-composite"]
+    temporary = out_path + ".tmp.png"
+    subprocess.run(cmd + ["-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8", temporary],
+                   check=True, timeout=60)
+    os.replace(temporary, out_path)
+
+
+# ---------- cyanotype style ----------
+#
+# A sun print of the sun. Where the other styles paint the sky, this one
+# charts it, white on Prussian blue: the whole compass unrolled across the
+# sheet, the horizon a ruled line, and the sun's path for today a wave over
+# and under it — a dot for each hour, solid where the sun has been and dotted
+# where it has yet to go. Behind it, faintly, the waves of the solstices and
+# the equinox: the most and least the sun ever does here. The blue deepens
+# from day to night, and the twilights are a wash that seeps under the horizon.
+
+CYANOTYPE = {
+    # line, then sky and earth by day, then sky and earth by night
+    "blue": ("e8eef5", "23559b", "1a4380", "0d1b3a", "0a1530"),
+    "paper": ("1d4c8f", "f0f3f2", "e2e8ea", "c3cedb", "b3c0d0"),
+}
+CYANOTYPE_SHEETS = ("f0f3f2", "0d1b3a")   # the paper, and the sky at night
+CYANOTYPE_HORIZON = 0.56      # how far down the sheet the horizon is ruled
+CYANOTYPE_ALT_SCALE = 0.5     # of the sheet's height, for 90 degrees of altitude
+CYANOTYPE_SUN_RADIUS = 0.014
+CYANOTYPE_MOON_RADIUS = 0.011
+CYANOTYPE_REFERENCE_DAYS = ((6, 21), (3, 20), (12, 21))
+
+
+def cyanotype_centre(lat, lon, local_day):
+    """The bearing at the middle of the sheet: south or north, whichever the
+    sun stands in at its highest today. In the tropics that turns with the
+    season."""
+    midnight = local_day.replace(hour=0, minute=0, second=0, microsecond=0)
+    _, az = max(solar_position(lat, lon, (midnight + datetime.timedelta(minutes=minute))
+                               .astimezone(datetime.timezone.utc))
+                for minute in range(0, 24 * 60, 10))
+    return 180 if 90 <= az < 270 else 0
+
+
+def cyanotype_screen(az, alt, centre=180):
+    """Fractions of the sheet's width and height for a bearing and altitude.
+    The full circle of the horizon runs across the sheet, with the bearing
+    `centre` in the middle."""
+    x = 0.5 + ((az - centre + 180) % 360 - 180) / 360
+    return x, CYANOTYPE_HORIZON - alt / 90 * CYANOTYPE_ALT_SCALE
+
+
+def sun_wave(lat, lon, local_day, centre=180, step=10):
+    """The sun through one local day: (minute, x, y) every `step` minutes."""
+    midnight = local_day.replace(hour=0, minute=0, second=0, microsecond=0)
+    wave = []
+    for minute in range(0, 24 * 60 + 1, step):
+        instant = (midnight + datetime.timedelta(minutes=minute)).astimezone(datetime.timezone.utc)
+        elev, az = solar_position(lat, lon, instant)
+        wave.append((minute, *cyanotype_screen(az, elev, centre)))
+    return wave
+
+
+def wave_runs(wave):
+    """Split a wave where it leaves one edge of the sheet and enters the other."""
+    runs = [[]]
+    for point in wave:
+        if runs[-1] and abs(point[1] - runs[-1][-1][1]) > 0.5:
+            runs.append([])
+        runs[-1].append(point)
+    return [run for run in runs if len(run) > 1]
+
+
+def cyanotype_ground(elev, alt, sky_day, earth_day, sky_night, earth_night, line):
+    """The wash at an altitude on the sheet, for the sun's elevation."""
+    exposure = smoothstep(-12, 10, elev)
+    sky = lerp(sky_night, sky_day, exposure)
+    earth = lerp(earth_night, earth_day, exposure)
+    if alt >= 0:
+        # A little lighter toward the horizon, as skies are.
+        return lerp(sky, line, 0.07 * smoothstep(40, 0, alt))
+    return lerp(earth, lerp(sky, line, 0.07), 0.6 * smoothstep(-18, 0, alt))
+
+
+def cyanotype_inks(colors):
+    """The line and the four washes (Oklab) in the theme's colours. On the
+    blue sheet the line is the theme's foreground; on paper it is its blue."""
+    tint = theme_tint(colors, *CYANOTYPE_SHEETS)
+    line, *washes = (tint(srgb_to_oklab(hexrgb(c)))
+                     for c in CYANOTYPE["paper" if is_light(colors) else "blue"])
+    if not is_light(colors):
+        printed = srgb_to_oklab(hexrgb(CYANOTYPE["blue"][0]))
+        line = lerp(printed, srgb_to_oklab(colors["foreground"]), THEME_INKS)
+    return line, washes
+
+
+def render_cyanotype(out_path, width, height, t_utc, lat, lon, colors):
+    line, washes = cyanotype_inks(colors)
+    line_hex = "#" + "".join(f"{round(clamp(v) * 255):02x}" for v in oklab_to_srgb(line))
+    elev, az = solar_position(lat, lon, t_utc)
+    local = t_utc.astimezone()
+    now_minute = local.hour * 60 + local.minute + local.second / 60
+
+    sheet = os.path.join(STATE_DIR, "cyanotype.ppm")
+    with open(sheet, "wb") as f:
+        f.write(f"P6\n1 {height}\n65535\n".encode())
+        for row in range(height):
+            alt = (CYANOTYPE_HORIZON - (row + 0.5) / height) / CYANOTYPE_ALT_SCALE * 90
+            color = oklab_to_srgb(cyanotype_ground(elev, alt, *washes, line))
+            f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in color)))
+
+    unit = height / 1200   # a hairline
+    mvg = ["stroke-linecap round", "stroke-linejoin round", f"stroke {line_hex}", "fill none"]
+
+    def polyline(points, opacity, weight, dash=None):
+        mvg.append(f"stroke-opacity {opacity} stroke-width {weight * unit:.2f} "
+                   f"stroke-dasharray {dash or 'none'}")
+        mvg.append("polyline " + " ".join(f"{x * width:.1f},{y * height:.1f}" for _, x, y in points))
+
+    def dot(x, y, radius, opacity, hollow=False):
+        cx, cy, r = x * width, y * height, radius
+        if hollow:
+            mvg.append(f"fill none fill-opacity 0 stroke-opacity {opacity} "
+                       f"stroke-width {1.4 * unit:.2f} stroke-dasharray none")
+        else:
+            mvg.append(f"fill {line_hex} fill-opacity {opacity} stroke-opacity 0")
+        mvg.append(f"circle {cx:.1f},{cy:.1f} {cx + r:.1f},{cy:.1f}")
+        mvg.append("fill none fill-opacity 0")
+
+    # The horizon, the compass along it, and the three depths of twilight.
+    horizon = CYANOTYPE_HORIZON
+    polyline([(0, 0, horizon), (0, 1, horizon)], 0.55, 1.0)
+    centre = cyanotype_centre(lat, lon, local)
+    for bearing in range(0, 360, 15):
+        reach = 0.012 if bearing % 90 == 0 else 0.006 if bearing % 45 == 0 else 0.003
+        x = bearing / 360
+        polyline([(0, x, horizon - reach), (0, x, horizon + reach)], 0.55, 1.0)
+    for depth in (6, 12, 18):
+        y = horizon + depth / 90 * CYANOTYPE_ALT_SCALE
+        polyline([(0, 0, y), (0, 1, y)], 0.16, 0.8, f"{unit:.2f} {7 * unit:.2f}")
+
+    # The year's extremes, then today: travelled, and still to come.
+    for month, day in CYANOTYPE_REFERENCE_DAYS:
+        for run in wave_runs(sun_wave(lat, lon, local.replace(month=month, day=day), centre)):
+            polyline(run, 0.17, 0.8)
+    today = sun_wave(lat, lon, local, centre)
+    for run in wave_runs([p for p in today if p[0] <= now_minute]):
+        polyline(run, 0.85, 1.5)
+    for run in wave_runs([p for p in today if p[0] >= now_minute]):
+        polyline(run, 0.5, 1.2, f"{unit:.2f} {5 * unit:.2f}")
+    for minute, x, y in today[:-1]:
+        if minute % 60 == 0:
+            hour = minute // 60
+            dot(x, y, (3.4 if hour % 6 == 0 else 2.2) * unit, 0.85 if minute <= now_minute else 0.5)
+
+    # The moon in its phase, and the sun: solid above the horizon, a ring below.
+    moon_alt, moon_az, fraction, _ = moon_position(lat, lon, t_utc)
+    sun_x, sun_y = cyanotype_screen(az, elev, centre)
+    moon_x, moon_y = cyanotype_screen(moon_az, moon_alt, centre)
+    radius = CYANOTYPE_MOON_RADIUS * height
+    toward = math.atan2((sun_y - moon_y) * height, (sun_x - moon_x) * width)
+    outline = moon_outline(moon_x * width, moon_y * height, radius, fraction, toward)
+    dot(moon_x, moon_y, radius, 0.35, hollow=True)
+    mvg.append(f"fill {line_hex} fill-opacity 0.85 stroke-opacity 0")
+    mvg.append("polygon " + " ".join(f"{x:.1f},{y:.1f}" for x, y in outline))
+    mvg.append("fill none fill-opacity 0")
+    radius = CYANOTYPE_SUN_RADIUS * height
+    if elev > 0:
+        dot(sun_x, sun_y, radius * 3.2, 0.07)
+        dot(sun_x, sun_y, radius * 1.9, 0.12)
+        dot(sun_x, sun_y, radius, 1.0)
+    else:
+        ground = oklab_to_srgb(cyanotype_ground(elev, elev, *washes, line))
+        mvg.append("fill #" + "".join(f"{round(clamp(v) * 255):02x}" for v in ground)
+                   + " fill-opacity 1 stroke-opacity 0")
+        mvg.append(f"circle {sun_x * width:.1f},{sun_y * height:.1f} "
+                   f"{sun_x * width + radius:.1f},{sun_y * height:.1f}")
+        mvg.append("fill none fill-opacity 0")
+        dot(sun_x, sun_y, radius, 0.9, hollow=True)
+
+    mvg_path = os.path.join(STATE_DIR, "cyanotype.mvg")
+    with open(mvg_path, "w") as f:
+        f.write("\n".join(mvg) + "\n")
+    temporary = out_path + ".tmp.png"
+    subprocess.run([which("magick"), sheet, "-scale", f"{width}x{height}!", "-draw", f"@{mvg_path}",
+                    "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8", temporary],
+                   check=True, timeout=60)
+    os.replace(temporary, out_path)
+
+
 def screen_size():
     if IS_MAC:
         try:
@@ -726,6 +1372,15 @@ def screen_size():
 def render_sky(out_path, width, height, t_utc, lat, lon, cloud, fog, colors):
     os.makedirs(STATE_DIR, exist_ok=True)
     elev, az = solar_position(lat, lon, t_utc)
+    if current_style() == "daylight":
+        render_daylight(out_path, width, height, t_utc, lat, lon)
+        return elev, az
+    if current_style() == "bokashi":
+        render_bokashi(out_path, width, height, t_utc, lat, lon, colors)
+        return elev, az
+    if current_style() == "cyanotype":
+        render_cyanotype(out_path, width, height, t_utc, lat, lon, colors)
+        return elev, az
     pixels = sky_field(colors, elev, az, cloud, fog)
 
     ppm_path = os.path.join(STATE_DIR, "field.ppm")
@@ -902,6 +1557,8 @@ def timer_disable():
 # ---------- commands ----------
 
 def weather_words(cloud, fog):
+    if current_style() != "sky":
+        return f"{current_style()} style"
     if fog:
         return "fog"
     return f"{round(cloud * 100)}% cloud"
@@ -912,6 +1569,7 @@ def configure(args):
     if args.config_command == "show":
         print(f"location: {config['location']}")
         print(f"weather: {'on' if config['weather'] else 'off'}")
+        print(f"style: {config['style']}")
     elif args.config_command == "location":
         if args.latitude == "auto":
             if args.longitude is not None:
@@ -931,6 +1589,10 @@ def configure(args):
         config["weather"] = args.value == "on"
         save_config(config)
         print(f"weather {'enabled' if config['weather'] else 'disabled'}")
+    elif args.config_command == "style":
+        config["style"] = args.value
+        save_config(config)
+        print(f"style set to {args.value}; run 'skybg once' to see it")
 
 
 def doctor():
@@ -988,6 +1650,8 @@ def parser():
     location.add_argument("longitude", nargs="?")
     weather = config_commands.add_parser("weather")
     weather.add_argument("value", choices=("on", "off"))
+    style = config_commands.add_parser("style")
+    style.add_argument("value", choices=STYLES)
     return p
 
 
@@ -1029,15 +1693,27 @@ def run(args):
             raise SkybgError("preview cloud cover must be between 0 and 100")
         with render_lock():
             out, cloud = render_preview(args.cloud)
-        print(f"wrote {out} ({round(cloud * 100)}% cloud)")
+        print(f"wrote {out} ({weather_words(cloud, False)})")
     elif cmd == "status":
         lat, lon = get_location()
         cloud, fog = get_weather(lat, lon)
         elev, az = solar_position(lat, lon, datetime.datetime.now(datetime.timezone.utc))
         stars = star_visibility(elev, max(cloud, 0.85) if fog else cloud) > 0
+        style = current_style()
         print(f"location: {lat:.4f}, {lon:.4f}")
         print(f"sun: {elev:+.1f}° elevation, {az:.0f}° azimuth ({phase_name(elev)})")
-        print(f"weather: {weather_words(cloud, fog)} — stars {'visible' if stars else 'hidden'}")
+        print(f"style: {style}")
+        if style == "daylight":
+            rise, fall = sun_times(lat, lon, datetime.datetime.now().astimezone())
+            clock = lambda h: f"{int(h):02d}:{round(h % 1 * 60) % 60:02d}"
+            print(f"sunrise {clock(rise)}, sunset {clock(fall)} — weather and theme not used")
+        elif style in ("bokashi", "cyanotype"):
+            alt, bearing, fraction, waxing = moon_position(
+                lat, lon, datetime.datetime.now(datetime.timezone.utc))
+            print(f"moon: {alt:+.1f}° elevation, {bearing:.0f}° azimuth, {round(fraction * 100)}% lit, "
+                  f"{'waxing' if waxing else 'waning'} — weather not used")
+        else:
+            print(f"weather: {weather_words(cloud, fog)} — stars {'visible' if stars else 'hidden'}")
         print(f"timer: {'active' if timer_active() else 'inactive'}")
         print(f"background owned by skybg: {'yes' if owns_background() else 'no'}")
     elif cmd == "doctor":

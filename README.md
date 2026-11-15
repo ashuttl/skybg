@@ -64,11 +64,55 @@ skybg config show
 skybg config location LAT LON
 skybg config location auto
 skybg config weather on|off
+skybg config style sky|daylight|bokashi|cyanotype
 ```
 
 Configuration lives at `${XDG_CONFIG_HOME:-~/.config}/skybg/config.json`.
 Generated images, cached location and weather, and the render lock live under
 `${XDG_STATE_HOME:-~/.local/state}/skybg/`.
+
+## Styles
+
+`sky`, the default, is everything described above: theme colors, the sun's
+glow crossing the screen, weather, stars and the Milky Way.
+
+`daylight` is a port of the Daylight wallpaper from
+[Pond](https://github.com/bflycomputer/pond-interface): a calm six-band
+gradient from a fixed palette of twelve moments in the day, blended in Oklab.
+It does not use the theme or the weather and makes no network requests. Where
+Pond assumes sunrise at 6:30 and sunset at 18:30, `skybg` paces the palette by
+the real sunrise and sunset at your location.
+
+`bokashi` is a sky the way a woodblock print makes one, after the printer's
+wiped gradation of the same name: a deep band of ink along the top edge, a
+flat ground, and a band of colour rising from the horizon — pink at dawn, red
+at dusk. A flat red sun sits where the sun is from your location, low all day
+in winter and high in summer, and sinks into the horizon band; the moon
+follows in its real phase, its lit side leaning toward the sun. The theme
+chooses the stock — natural paper under a light theme, indigo-dyed under a
+dark one — and tints the inks: each keeps the lightness it was printed with
+and takes its hue from the theme's blue, red, yellow or magenta, and the
+sheet itself sits on the theme's background. It does not use the weather.
+
+`cyanotype` charts the sky instead of painting it — a sun print of the sun,
+white on Prussian blue. The whole compass is unrolled across the screen and
+the horizon ruled through it. Today's path of the sun is a wave over and under
+that line, a dot for each hour, solid where the sun has been and dotted where
+it has yet to go; the sun rides it as a disc by day and a ring by night, and
+the moon keeps its place and phase. Behind, faintly, are the paths of the
+solstices and the equinox: the most and the least the sun ever does where you
+are — a tall narrow wave near the poles, a wall near the equator. The blue
+deepens from day to night, with the three twilights as a wash under the
+horizon. The blue is the theme's blue, the sheet deepens to the theme's
+background at night, and the line is its foreground; a light theme turns it
+into blue line on paper the colour of its background. It does not use the
+weather.
+
+```sh
+skybg config style bokashi     # or cyanotype
+skybg preview
+skybg once
+```
 
 ## Location, weather, and privacy
 
@@ -120,4 +164,7 @@ Uninstalling never changes the current background.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The `daylight` style's palette and interpolation
+are ported from Pond's `pond-wallpaper`, © 2026 Butterfly Interaction Inc.,
+under the BSD 3-Clause license in
+[LICENSES/pond-wallpaper.txt](LICENSES/pond-wallpaper.txt).

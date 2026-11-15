@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Add a fourth style, `cyanotype`: a white-on-Prussian-blue chart of the sun's
+  path for today over a ruled horizon, with the solstice and equinox paths
+  behind it, the sun and moon in place, and the twilights as a wash below.
+- Add a third style, `bokashi`: a woodblock-print sky of wiped ink bands, with
+  a flat sun placed by the real sun and the moon in its real phase. The theme
+  chooses natural paper or indigo-dyed stock. It ignores the weather.
+- `bokashi` and `cyanotype` take their colours from the theme: each ink keeps
+  its printed lightness and turns to the hue of the matching theme colour, and
+  the sheet sits on the theme's background.
+- Add a second style, `daylight`, ported from Pond's Daylight wallpaper: a
+  fixed twelve-moment palette blended in Oklab, paced by the real sunrise and
+  sunset at the configured location. It ignores the theme and the weather.
+  Choose with `skybg config style sky|daylight|bokashi|cyanotype`.
 - Show the real night sky: the Yale Bright Star Catalogue to the naked-eye
   limit, each star at its magnitude and colour, and the Milky Way from NASA's
   Deep Star Maps 2020, both bundled and projected for the location and the

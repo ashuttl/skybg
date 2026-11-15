@@ -302,7 +302,222 @@ class ConfigAndCliTests(unittest.TestCase):
                 mock.patch.object(skybg, "CONFIG_DIR", directory), \
                 mock.patch.object(skybg, "CONFIG_FILE", os.path.join(directory, "config.json")):
             skybg.save_config({"location": [10, 20], "weather": False})
-            self.assertEqual(skybg.load_config(), {"location": [10, 20], "weather": False})
+            self.assertEqual(skybg.load_config(),
+                             {"location": [10, 20], "weather": False, "style": "sky"})
+
+    def test_style_is_saved_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(skybg, "CONFIG_DIR", directory), \
+                mock.patch.object(skybg, "CONFIG_FILE", os.path.join(directory, "config.json")):
+            with mock.patch("sys.stdout", io.StringIO()):
+                skybg.run(skybg.parser().parse_args(["config", "style", "daylight"]))
+            self.assertEqual(skybg.current_style(), "daylight")
+            skybg.save_config({"style": "sunny"})
+            with self.assertRaisesRegex(skybg.SkybgError, "unknown style"):
+                skybg.load_config()
+
+
+class DaylightTests(unittest.TestCase):
+    def test_palette_hours_land_on_sunrise_and_sunset(self):
+        # Wherever the real sunrise and sunset fall, they show the palette's.
+        for sunrise, sunset in ((6.5, 18.5), (7.2, 16.1), (4.9, 20.4)):
+            self.assertAlmostEqual(skybg.daylight_palette_hour(sunrise, sunrise, sunset), 6.5)
+            self.assertAlmostEqual(skybg.daylight_palette_hour(sunset, sunrise, sunset), 18.5)
+
+    def test_anchor_hours_reproduce_the_palette(self):
+        # At sunrise, whenever it is, the bands are the palette's sunrise anchor.
+        stops = skybg.daylight_stops(7.2, sunrise=7.2, sunset=16.1)
+        self.assertEqual([round(position, 6) for position, _ in stops][::5], [0, 1])
+        for (_, color), expected in zip(stops, ["2e3b52", "4c596d", "76757f",
+                                                "a6868f", "bf948a", "87717a"]):
+            for got, want in zip(color, skybg.srgb_to_oklab(skybg.hexrgb(expected))):
+                self.assertAlmostEqual(got, want)
+
+    def test_the_day_is_continuous_through_midnight(self):
+        before, after = skybg.daylight_stops(23.999), skybg.daylight_stops(0.001)
+        for (p0, c0), (p1, c1) in zip(before, after):
+            self.assertAlmostEqual(p0, p1, places=3)
+            for v0, v1 in zip(c0, c1):
+                self.assertAlmostEqual(v0, v1, places=3)
+
+    def test_colors_stay_in_gamut_and_brighten_by_day(self):
+        def luminance(hour):
+            color = skybg.daylight_color(skybg.daylight_stops(hour), 0.5)
+            self.assertTrue(all(0 <= v <= 1 for v in color))
+            return sum(color)
+        for hour in range(24):
+            luminance(hour)
+        self.assertGreater(luminance(12), luminance(6.5))
+        self.assertGreater(luminance(6.5), luminance(0))
+
+    def test_oklab_round_trips(self):
+        for color in ((0.1, 0.5, 0.9), (0.74, 0.58, 0.54), (0.03, 0.04, 0.09)):
+            for got, want in zip(skybg.oklab_to_srgb(skybg.srgb_to_oklab(color)), color):
+                self.assertAlmostEqual(got, want, places=5)
+
+    def test_sun_times_follow_the_season(self):
+        eastern = datetime.timezone(datetime.timedelta(hours=-5))
+        rise, fall = skybg.sun_times(43.677, -70.371,
+                                     datetime.datetime(2026, 12, 21, 12, tzinfo=eastern))
+        self.assertAlmostEqual(rise, 7.2, delta=0.2)
+        self.assertAlmostEqual(fall, 16.1, delta=0.2)
+        # Midnight sun: fall back to the palette's own day.
+        utc = datetime.timezone.utc
+        self.assertEqual(skybg.sun_times(78.2, 15.6, datetime.datetime(2026, 6, 21, 12, tzinfo=utc)),
+                         (6.5, 18.5))
+
+    def test_bokashi_bands_meet_the_ground(self):
+        for stock in ("paper", "indigo"):
+            for morning in (True, False):
+                for elev in (-30, -9, -3, 0.5, 7, 22, 70):
+                    inks, top_reach, horizon_reach = skybg.bokashi_inks(elev, morning, stock)
+                    self.assertLess(top_reach + horizon_reach, 1)
+                    self.assertEqual(skybg.bokashi_color(inks, top_reach, horizon_reach, 0), inks[0])
+                    self.assertEqual(skybg.bokashi_color(inks, top_reach, horizon_reach, 1), inks[3])
+                    middle = (top_reach + 1 - horizon_reach) / 2
+                    self.assertEqual(
+                        skybg.bokashi_color(inks, top_reach, horizon_reach, middle), inks[1])
+
+    def test_bokashi_day_stock_follows_the_theme(self):
+        lightness = lambda stock: skybg.bokashi_inks(40, False, stock)[0][1][0]
+        self.assertGreater(lightness("paper"), 0.9)
+        self.assertLess(lightness("indigo"), 0.65)
+        # The twilights are the same on either stock.
+        self.assertEqual(skybg.bokashi_inks(-5, True, "paper"), skybg.bokashi_inks(-5, True, "indigo"))
+
+    def test_bokashi_sheet_faces_the_sun(self):
+        # East is on the left facing south, on the right facing north.
+        self.assertLess(skybg.bokashi_screen(90, 10, 43.7)[0], 0.5)
+        self.assertGreater(skybg.bokashi_screen(90, 10, -33.9)[0], 0.5)
+        self.assertAlmostEqual(skybg.bokashi_screen(180, 0, 43.7)[1], 1.0)
+        self.assertAlmostEqual(skybg.bokashi_screen(0, 0, -33.9)[0], 0.5)
+
+    def test_moon_phases(self):
+        utc = datetime.timezone.utc
+        new = skybg.moon_position(0, 0, datetime.datetime(2000, 1, 6, 18, 14, tzinfo=utc))
+        full = skybg.moon_position(0, 0, datetime.datetime(2026, 11, 24, 14, 53, tzinfo=utc))
+        self.assertLess(new[2], 0.01)
+        self.assertGreater(full[2], 0.99)
+        waxing = skybg.moon_position(0, 0, datetime.datetime(2026, 11, 14, 12, tzinfo=utc))
+        self.assertTrue(waxing[3])
+        self.assertAlmostEqual(waxing[2], 0.25, delta=0.06)
+
+    def test_full_moon_stands_opposite_the_sun(self):
+        instant = datetime.datetime(2026, 11, 25, 5, tzinfo=datetime.timezone.utc)  # Maine midnight
+        alt, az, _, _ = skybg.moon_position(43.677, -70.371, instant)
+        sun_alt, _ = skybg.solar_position(43.677, -70.371, instant)
+        self.assertGreater(alt, 55)
+        self.assertLess(sun_alt, -55)
+        self.assertAlmostEqual(az, 180, delta=25)
+
+    def test_moon_outline_grows_with_the_phase(self):
+        def area(points):
+            return abs(sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1)
+                           in zip(points, points[1:] + points[:1]))) / 2
+        disc = math.pi * 100
+        self.assertAlmostEqual(area(skybg.moon_outline(0, 0, 10, 0.0, 1.0)), 0, delta=0.5)
+        self.assertAlmostEqual(area(skybg.moon_outline(0, 0, 10, 0.5, 1.0)), disc / 2, delta=1)
+        self.assertAlmostEqual(area(skybg.moon_outline(0, 0, 10, 1.0, 1.0)), disc, delta=1)
+        # The lit limb is on the side the sun is on.
+        lit = skybg.moon_outline(0, 0, 10, 0.2, math.pi)
+        self.assertLess(sum(x for x, _ in lit) / len(lit), 0)
+
+    def test_cyanotype_sheet_holds_the_whole_compass(self):
+        self.assertEqual(skybg.cyanotype_screen(180, 0), (0.5, skybg.CYANOTYPE_HORIZON))
+        self.assertAlmostEqual(skybg.cyanotype_screen(90, 0)[0], 0.25)
+        self.assertAlmostEqual(skybg.cyanotype_screen(90, 0, centre=0)[0], 0.75)
+        # Up is up, and the lowest the sun can be is still on the sheet.
+        self.assertLess(skybg.cyanotype_screen(180, 45)[1], skybg.CYANOTYPE_HORIZON)
+        self.assertLess(skybg.cyanotype_screen(0, -90)[1], 1.1)
+
+    def test_cyanotype_faces_the_noon_sun(self):
+        eastern = datetime.timezone(datetime.timedelta(hours=-5))
+        sydney = datetime.timezone(datetime.timedelta(hours=11))
+        singapore = datetime.timezone(datetime.timedelta(hours=8))
+        day = lambda month, zone: datetime.datetime(2026, month, 21, 12, tzinfo=zone)
+        self.assertEqual(skybg.cyanotype_centre(43.677, -70.371, day(12, eastern)), 180)
+        self.assertEqual(skybg.cyanotype_centre(-33.87, 151.2, day(12, sydney)), 0)
+        # In the tropics the noon sun changes sides with the season.
+        self.assertEqual(skybg.cyanotype_centre(1.35, 103.8, day(6, singapore)), 0)
+        self.assertEqual(skybg.cyanotype_centre(1.35, 103.8, day(12, singapore)), 180)
+
+    def test_sun_wave_crosses_the_horizon_twice_and_is_higher_in_summer(self):
+        eastern = datetime.timezone(datetime.timedelta(hours=-5))
+        def wave(month):
+            return skybg.sun_wave(43.677, -70.371, datetime.datetime(2026, month, 21, 12, tzinfo=eastern))
+        winter, summer = wave(12), wave(6)
+        above = [y < skybg.CYANOTYPE_HORIZON for _, _, y in winter]
+        self.assertEqual(sum(a != b for a, b in zip(above, above[1:])), 2)
+        self.assertLess(min(y for _, _, y in summer), min(y for _, _, y in winter))
+        self.assertEqual(winter[0][0], 0)
+        self.assertEqual(winter[-1][0], 24 * 60)
+
+    def test_wave_runs_split_at_the_sheet_edge(self):
+        wave = [(0, 0.90, 0.5), (10, 0.98, 0.5), (20, 0.02, 0.5), (30, 0.10, 0.5)]
+        self.assertEqual([len(run) for run in skybg.wave_runs(wave)], [2, 2])
+        self.assertEqual(skybg.wave_runs(wave[:1]), [])
+
+    def test_cyanotype_ground_deepens_at_night(self):
+        washes = [skybg.srgb_to_oklab(skybg.hexrgb(c)) for c in skybg.CYANOTYPE["blue"]]
+        line, rest = washes[0], washes[1:]
+        day = skybg.cyanotype_ground(30, 60, *rest, line)
+        night = skybg.cyanotype_ground(-30, 60, *rest, line)
+        self.assertGreater(day[0], night[0])
+        # Twilight seeps under the horizon: lighter just below it than far below.
+        self.assertGreater(skybg.cyanotype_ground(30, -2, *rest, line)[0],
+                           skybg.cyanotype_ground(30, -40, *rest, line)[0])
+
+    def theme(self, background, **hues):
+        colors = {"background": background, "foreground": "#808080", "red": "#d9532f",
+                  "orange": "#e08a52", "yellow": "#f0bd62", "blue": "#2c66ae",
+                  "cyan": "#86c8e8", "magenta": "#a96bb4", **hues}
+        return {name: skybg.hexrgb(value) for name, value in colors.items()}
+
+    def test_theme_inks_put_the_sheet_on_the_background(self):
+        paper, night = "ece6d6", "1a2238"
+        for background, sheet in (("#cdd4bb", paper), ("#191724", night)):
+            colors = self.theme(background)
+            tinted = skybg.theme_tint(colors, paper, night)(skybg.srgb_to_oklab(skybg.hexrgb(sheet)))
+            for got, want in zip(tinted, skybg.srgb_to_oklab(colors["background"])):
+                self.assertAlmostEqual(got, want, places=3)
+
+    def test_theme_inks_keep_lightness_and_take_the_theme_hue(self):
+        ink = skybg.srgb_to_oklab(skybg.hexrgb("2c66ae"))
+        teal = self.theme("#191724", blue="#3aa0a0")
+        tinted = skybg.theme_tint(teal, "ece6d6", "1a2238")(ink)
+        self.assertAlmostEqual(tinted[0], ink[0], delta=0.03)
+        self.assertAlmostEqual(skybg.oklab_hue(tinted),
+                               skybg.oklab_hue(skybg.srgb_to_oklab(teal["blue"])), delta=6)
+        # A grey theme drains the ink rather than turning it.
+        grey = self.theme("#191919", **{name: "#888888" for name in
+                                        ("red", "orange", "yellow", "blue", "cyan", "magenta")})
+        drained = skybg.theme_tint(grey, "ece6d6", "1a2238")(ink)
+        self.assertLess(math.hypot(drained[1], drained[2]), 0.02)
+
+    def test_theme_inks_can_be_left_as_printed(self):
+        ink = skybg.srgb_to_oklab(skybg.hexrgb("d08a8a"))
+        with mock.patch.object(skybg, "THEME_INKS", 0.0):
+            tinted = skybg.theme_tint(self.theme("#191724", red="#00ff00"), "ece6d6", "1a2238")(ink)
+        for got, want in zip(tinted, ink):
+            self.assertAlmostEqual(got, want)
+
+    def test_cyanotype_line_follows_the_theme(self):
+        dark = self.theme("#191724", foreground="#e0def4")
+        line, washes = skybg.cyanotype_inks(dark)
+        for got, want in zip(line, skybg.srgb_to_oklab(dark["foreground"])):
+            self.assertAlmostEqual(got, want)
+        self.assertEqual(len(washes), 4)
+        # On paper the line is ink: darker than the sheet it is drawn on.
+        line, washes = skybg.cyanotype_inks(self.theme("#cdd4bb"))
+        self.assertLess(line[0], washes[0][0] - 0.3)
+
+    def test_daylight_never_asks_for_weather(self):
+        with mock.patch.object(skybg, "load_config",
+                               return_value={"location": "auto", "weather": True,
+                                             "style": "daylight"}), \
+                mock.patch.object(skybg.urllib.request, "urlopen") as urlopen:
+            self.assertEqual(skybg.get_weather(43.677, -70.371), (0.0, False))
+        urlopen.assert_not_called()
 
 
 if __name__ == "__main__":
