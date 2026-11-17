@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- On macOS, run the launch agent with the Python 3.11+ that installed it.
+  launchd's `PATH` finds only the system's Python 3.9, which could not even
+  load the new styles, so every timer tick failed silently. `skybg doctor` now
+  checks the agent's Python; rerun `./install.sh` to update the agent.
 - Add a fourth style, `cyanotype`: a white-on-Prussian-blue chart of the sun's
   path for today over a ruled horizon, with the solstice and equinox paths
   behind it, the sun and moon in place, and the twilights as a wash below.
@@ -36,10 +40,15 @@
   whole cycle out.
 - Key the weather cache by location, so changing location no longer serves the
   previous location's weather until the TTL expires.
-- Give every render its own file name and prune old ones. On macOS, when
-  another Space still showed one of the two alternating names, the wallpaper
-  agent reused the image it had decoded hours earlier, so every other tick put
-  back a stale sky — daylight at night.
+- Never give a render the name of one that a Space still shows, and prune old
+  ones. On macOS, when another Space still showed one of the two alternating
+  names, the wallpaper agent reused the image it had decoded hours earlier, so
+  every other tick put back a stale sky — daylight at night. Renders are now
+  `sky-0.png` upward, skipping every name the wallpaper store records for any
+  Space or display, and the last two renders, which macOS may still be
+  loading or briefly holding on to. The names stay few because macOS keeps
+  every image file it is given in a list it rechecks on each change: a new
+  name every tick made each change take half a minute within weeks.
 
 ## 0.1.0 — 2026-08-16
 

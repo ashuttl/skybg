@@ -31,6 +31,17 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
+if [[ $PLATFORM == Darwin ]]; then
+  # launchd runs agents with PATH=/usr/bin:/bin:/usr/sbin:/sbin, where python3
+  # is the system's 3.9, so the agent names the interpreter installing it.
+  PYTHON=$(command -v python3)
+  if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+    echo "skybg: needs Python 3.11 or newer; $PYTHON is $("$PYTHON" -V 2>&1)" >&2
+    echo "On macOS, Python can be installed with: brew install python" >&2
+    exit 1
+  fi
+fi
+
 backup_if_changed() {
   local source=$1 destination=$2
   if [[ -e $destination ]] && ! cmp -s "$source" "$destination"; then
@@ -61,6 +72,7 @@ if [[ $PLATFORM == Darwin ]]; then
   <string>com.skybg.tick</string>
   <key>ProgramArguments</key>
   <array>
+    <string>${PYTHON}</string>
     <string>${BIN_DIR}/skybg</string>
     <string>tick</string>
   </array>

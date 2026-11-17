@@ -5,6 +5,8 @@ import io
 import json
 import math
 import os
+import plistlib
+import sys
 import tempfile
 import time
 import unittest
@@ -244,11 +246,22 @@ class WeatherTests(unittest.TestCase):
 
 
 class BackgroundTests(unittest.TestCase):
-    def _generate(self, directory, current):
+    def _generate(self, directory, current="", store=None):
+        """Render and set once. With `store`, run as macOS with those paths in
+        the wallpaper store; without, as Omarchy showing `current`."""
+        clock = [time.time()]
+
         def render(out_path, *args):
             open(out_path, "w").close()
+            # Each render is newer than the last, whatever the clock resolution.
+            clock[0] += 10
+            os.utime(out_path, (clock[0], clock[0]))
             return 0.0, 0.0
+        for path in os.listdir(directory):
+            clock[0] = max(clock[0], os.path.getmtime(os.path.join(directory, path)))
         with mock.patch.object(skybg, "STATE_DIR", directory), \
+                mock.patch.object(skybg, "IS_MAC", store is not None), \
+                mock.patch.object(skybg, "wallpaper_store_paths", return_value=set(store or ())), \
                 mock.patch.object(skybg, "get_location", return_value=(43.677, -70.371)), \
                 mock.patch.object(skybg, "get_weather", return_value=(0.0, False)), \
                 mock.patch.object(skybg, "screen_size", return_value=(10, 10)), \
@@ -259,25 +272,88 @@ class BackgroundTests(unittest.TestCase):
             skybg.generate_and_set()
         return set_background.call_args.args[0]
 
-    def test_every_render_gets_a_new_name(self):
-        # macOS reuses its decoded image for a path another Space still shows,
-        # so no render may reuse the name of an earlier one.
+    def test_renders_cycle_through_three_names(self):
+        # Each render needs a path the desktop is not showing and macOS has
+        # not just let go of, but no more names than that: macOS rechecks
+        # every image it was ever given.
         with tempfile.TemporaryDirectory() as directory:
             directory = os.path.realpath(directory)
-            first = self._generate(directory, "")
-            second = self._generate(directory, first)
-            third = self._generate(directory, second)
-            self.assertEqual(len({first, second, third}), 3)
+            names = []
+            for _ in range(5):
+                names.append(self._generate(directory, names[-1] if names else ""))
+            self.assertEqual([os.path.basename(name) for name in names],
+                             ["sky-0.png", "sky-1.png", "sky-2.png", "sky-0.png", "sky-1.png"])
+            self.assertEqual(sorted(os.listdir(directory)),
+                             ["render.lock", "sky-0.png", "sky-1.png", "sky-2.png"])
+
+    def test_names_shown_by_any_space_are_skipped(self):
+        # macOS reuses its decoded image for a path another Space still shows.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            shown = {os.path.join(directory, "sky-0.png"), os.path.join(directory, "sky-2.png")}
+            for path in shown:
+                open(path, "w").close()
+            first = self._generate(directory, store=shown)
+            self.assertEqual(os.path.basename(first), "sky-1.png")
+            # The store has not caught up with the first render yet.
+            second = self._generate(directory, store=shown)
+            self.assertEqual(os.path.basename(second), "sky-3.png")
+            self.assertEqual(sorted(os.listdir(directory)),
+                             ["render.lock", "sky-0.png", "sky-1.png", "sky-2.png", "sky-3.png"])
 
     def test_old_renders_are_pruned(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = os.path.realpath(directory)
-            for name in ("sky-a.png", "sky-b.png", "stars.mvg"):
-                open(os.path.join(directory, name), "w").close()
-            current = os.path.join(directory, "sky-b.png")
+            for age, name in enumerate(("sky-b.png", "sky-a.png", "sky-1790811288742357000.png",
+                                        "sky-0.png.tmp.png", "stars.mvg")):
+                path = os.path.join(directory, name)
+                open(path, "w").close()
+                os.utime(path, (time.time() - 1000 * (age + 1),) * 2)
+            current = os.path.join(directory, "sky-a.png")
             new = self._generate(directory, current)
             self.assertEqual(sorted(os.listdir(directory)),
-                             sorted([os.path.basename(new), "sky-b.png", "stars.mvg", "render.lock"]))
+                             sorted([os.path.basename(new), "sky-a.png", "sky-b.png",
+                                     "stars.mvg", "render.lock"]))
+
+    def test_wallpaper_store_paths_reads_nested_choices(self):
+        configuration = plistlib.dumps(
+            {"type": "imageFile",
+             "url": {"relative": "file:///Users/someone/state%20dir/sky-3.png"}},
+            fmt=plistlib.FMT_BINARY)
+        store = {"Spaces": {"A": {"Default": {"Desktop": {"Content": {"Choices": [
+                    {"Provider": "com.apple.wallpaper.choice.image",
+                     "Configuration": configuration}]}}}}},
+                 "SystemDefault": {"Desktop": {"Content": {"Choices": [
+                     {"Configuration": b"bplist00 not really"}]}}}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "Index.plist")
+            with open(path, "wb") as f:
+                plistlib.dump(store, f, fmt=plistlib.FMT_BINARY)
+            with mock.patch.object(skybg, "WALLPAPER_STORE", path):
+                self.assertEqual(skybg.wallpaper_store_paths(),
+                                 {os.path.realpath("/Users/someone/state dir/sky-3.png")})
+            with mock.patch.object(skybg, "WALLPAPER_STORE", os.path.join(directory, "missing")):
+                self.assertEqual(skybg.wallpaper_store_paths(), set())
+
+
+class LaunchAgentTests(unittest.TestCase):
+    def _agent_python(self, program):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "agent.plist")
+            with open(path, "wb") as f:
+                plistlib.dump({"ProgramArguments": [program, "skybg", "tick"]}, f)
+            with mock.patch.object(skybg, "LAUNCH_AGENT_PLIST", path):
+                return skybg.agent_python()
+
+    def test_named_interpreter_is_checked(self):
+        okay, detail = self._agent_python(sys.executable)
+        self.assertEqual(okay, sys.version_info >= (3, 11))
+        self.assertIn(sys.executable, detail)
+
+    def test_missing_interpreter_fails(self):
+        okay, detail = self._agent_python("/nonexistent/python3")
+        self.assertFalse(okay)
+        self.assertIn("rerun ./install.sh", detail)
 
 
 class ConfigAndCliTests(unittest.TestCase):

@@ -138,14 +138,20 @@ sources and licences) and are never fetched at run time.
 
 `skybg` uses `omarchy theme bg set` to change the live background. A supported
 `theme-set` hook rerenders while its timer is active, so every theme supplies
-its own palette. The current background alternates between two generated files
-because Quattro watches the background symlink target.
+its own palette. Each render takes a different name from the last two —
+`sky-0.png`, `sky-1.png`, `sky-2.png` in turn — because Quattro watches the
+background symlink target.
 
 ## macOS integration
 
-On macOS, the timer is a launchd agent (`com.skybg.tick`, every five minutes),
-the display size comes from `system_profiler`, and the wallpaper is set
+On macOS, the timer is a launchd agent (`com.skybg.tick`, every five minutes)
+that runs the `python3` the installer found — launchd's own `PATH` reaches only
+the system's Python 3.9, so rerun `./install.sh` if you change Pythons. The
+display size comes from `system_profiler`, and the wallpaper is set
 through System Events — which covers every display in the current Space.
+macOS remembers every image file it is ever given as a wallpaper and rechecks
+them all on each change, so `skybg` reuses a few file names rather than making
+a new one each time, skipping any name that another Space still shows.
 Without an Omarchy theme, colors come from a built-in palette that follows the
 system light/dark appearance and retints within one tick of a switch. To use
 your own palette instead, drop an Omarchy-style `colors.toml` at

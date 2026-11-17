@@ -31,6 +31,9 @@ if [[ $PLATFORM == Darwin ]]; then
   test -f "$PLIST"
   grep -q "$TEST_HOME/.local/bin/skybg" "$PLIST"
   plutil -lint "$PLIST" >/dev/null
+  # launchd's PATH finds only the system's Python 3.9; the agent names its own.
+  AGENT_PYTHON=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST")
+  "$AGENT_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 11))'
 else
   test -f "$TEST_HOME/xdg-config/systemd/user/skybg.service"
   test -f "$TEST_HOME/xdg-config/systemd/user/skybg.timer"

@@ -44,15 +44,18 @@ import argparse
 import contextlib
 import fcntl
 import gzip
+import itertools
 import json
 import math
 import os
+import plistlib
 import re
 import shutil
 import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -65,6 +68,8 @@ COLORS_TOML = os.path.join(HOME, ".local/state/omarchy/current/theme/colors.toml
 BACKGROUND_LINK = os.path.join(HOME, ".local/state/omarchy/current/background")
 LAUNCH_AGENT_LABEL = "com.skybg.tick"
 LAUNCH_AGENT_PLIST = os.path.join(HOME, "Library/LaunchAgents", LAUNCH_AGENT_LABEL + ".plist")
+WALLPAPER_STORE = os.path.join(HOME, "Library/Application Support/com.apple.wallpaper/Store/Index.plist")
+RENDER_NAME = re.compile(r"sky-[^.]+\.png")
 LOCATION_CACHE = os.path.join(STATE_DIR, "location")
 WEATHER_CACHE = os.path.join(STATE_DIR, "weather.json")
 FOREIGN_MARKER = os.path.join(STATE_DIR, "foreign-seen")
@@ -1435,31 +1440,83 @@ def set_background(path):
         subprocess.run([which("omarchy"), "theme", "bg", "set", path], check=True, timeout=30)
 
 
+def wallpaper_store_paths():
+    """Real paths of every image the macOS wallpaper store records, for any
+    Space or display, current or long gone. Each choice is a nested binary
+    plist; an unreadable store records nothing."""
+    found = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, bytes) and value.startswith(b"bplist"):
+            # A corrupt blob can fail in many ways; skip it and keep the rest.
+            with contextlib.suppress(Exception):
+                walk(plistlib.loads(value))
+        elif isinstance(value, str) and value.startswith("file://"):
+            found.add(os.path.realpath(urllib.parse.unquote(urllib.parse.urlparse(value).path)))
+
+    try:
+        with open(WALLPAPER_STORE, "rb") as f:
+            store = plistlib.load(f)
+    except Exception:
+        return found
+    walk(store)
+    return found
+
+
+def recent_renders(count=2):
+    """The `count` most recently written renders, newest first."""
+    paths = [os.path.join(STATE_DIR, name) for name in os.listdir(STATE_DIR)
+             if RENDER_NAME.fullmatch(name)]
+    return sorted(paths, key=os.path.getmtime, reverse=True)[:count]
+
+
+def renders_in_use():
+    """Real paths of renders that must not be overwritten yet: the current
+    background (on macOS, the image each Space and display was last given)
+    and the last two renders. The desktop may not have reached the latest
+    yet, and macOS keeps the one before it loaded for a few seconds after it
+    is replaced, bringing that image back if its path is set again meanwhile."""
+    in_use = wallpaper_store_paths() if IS_MAC else {current_background()}
+    in_use.update(os.path.realpath(path) for path in recent_renders())
+    return in_use - {""}
+
+
 def generate_and_set():
     with render_lock():
         lat, lon = get_location()
         cloud, fog = get_weather(lat, lon)
         width, height = screen_size()
 
-        # A new name for every render: background watchers key on the path.
-        # Quattro watches the symlink target, and macOS's wallpaper agent
-        # reuses the image it already decoded for a path while any other Space
-        # still shows that path — so alternating two names brought back a
-        # render from hours earlier on every other tick.
-        previous = current_background()
-        out_path = os.path.join(STATE_DIR, f"sky-{time.time_ns()}.png")
+        # Background watchers key on the path, so a render never reuses the
+        # name of one that a desktop is showing: Quattro watches the symlink
+        # target, and macOS's wallpaper agent reuses the image it decoded for
+        # a path while any Space still shows that path. But the names come
+        # from a small pool, sky-0.png upward: macOS remembers every image
+        # file it is ever given and rechecks that whole list on every change,
+        # so with a new name each tick, every change took longer until it
+        # took half a minute.
+        in_use = renders_in_use()
+        out_path = next(path for path in (os.path.join(STATE_DIR, f"sky-{k}.png")
+                                          for k in itertools.count())
+                        if os.path.realpath(path) not in in_use)
 
         elev, az = render_sky(out_path, width, height,
                               datetime.datetime.now(datetime.timezone.utc),
                               lat, lon, cloud, fog, theme_colors())
         set_background(out_path)
-        prune_renders(keep={os.path.realpath(out_path), previous})
+        prune_renders(keep=in_use | {os.path.realpath(out_path)})
     return elev, cloud, fog
 
 
 def prune_renders(keep):
-    """Delete old renders, keeping `keep`: the new one, and the one it
-    replaces, which may still be mid-transition."""
+    """Delete renders other than `keep`: the new one, and those a desktop may
+    still show or be loading."""
     for name in os.listdir(STATE_DIR):
         path = os.path.join(STATE_DIR, name)
         if name.startswith("sky-") and name.endswith(".png") and os.path.realpath(path) not in keep:
@@ -1595,6 +1652,27 @@ def configure(args):
         print(f"style set to {args.value}; run 'skybg once' to see it")
 
 
+def agent_python():
+    """(okay, detail) for the Python the launch agent runs skybg with. A plist
+    that starts with skybg itself gets python3 from launchd's PATH, which
+    finds only the system's Python 3.9."""
+    try:
+        with open(LAUNCH_AGENT_PLIST, "rb") as f:
+            program = plistlib.load(f)["ProgramArguments"][0]
+    except Exception as exc:
+        return False, f"could not read {LAUNCH_AGENT_PLIST}: {exc}"
+    python = program
+    if os.path.basename(program) == "skybg":
+        python = shutil.which("python3", path="/usr/bin:/bin:/usr/sbin:/sbin") or "python3"
+    try:
+        version = subprocess.run([python, "-c", "import sys; print(sys.version.split()[0])"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        okay = tuple(int(part) for part in version.split(".")[:2]) >= (3, 11)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False, f"{python} does not run; rerun ./install.sh"
+    return okay, f"{python} {version}" + ("" if okay else " (needs 3.11+); rerun ./install.sh")
+
+
 def doctor():
     checks = []
     advisory = set()
@@ -1611,6 +1689,8 @@ def doctor():
         checks.append(("theme colors", True, sources[kind]))
         checks.append((LAUNCH_AGENT_LABEL, os.path.isfile(LAUNCH_AGENT_PLIST),
                        "installed launch agent"))
+        if os.path.isfile(LAUNCH_AGENT_PLIST):
+            checks.append(("launch agent Python", *agent_python()))
     else:
         checks.append(("Omarchy theme", os.path.isfile(COLORS_TOML), COLORS_TOML))
         checks.append(("Hyprland session", bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")),
