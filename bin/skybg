@@ -24,7 +24,14 @@ where the sun is, and the moon in its phase, in inks tinted by the theme.
 A fourth, "cyanotype", charts the sky instead of painting it: white on
 Prussian blue, the sun's path for today as a wave over and under a ruled
 horizon, with the solstice and equinox paths behind it; the blue is the
-theme's. Choose with `skybg config style`.
+theme's.
+
+Three more: "gradient" is a plain gradient that turns with the sun like the
+shadow on a sundial, lit from wherever the sun is; "window" is the sun
+through a window, its panes thrown into a bare room, across the far wall and
+the floor, softened and put out by cloud, with the moon's at night; "slitscan" is the whole day at once, each
+column of the screen the sky at a different hour, with now in the middle.
+Choose with `skybg config style`.
 
 Commands:
   skybg on             generate + set the background, and start the 5-minute timer
@@ -75,7 +82,8 @@ WEATHER_CACHE = os.path.join(STATE_DIR, "weather.json")
 FOREIGN_MARKER = os.path.join(STATE_DIR, "foreign-seen")
 WEATHER_TTL = 1200  # seconds
 FOG_CODES = {45, 48}
-STYLES = ("sky", "daylight", "bokashi", "cyanotype")
+STYLES = ("sky", "daylight", "bokashi", "cyanotype", "gradient", "window", "slitscan")
+WEATHER_STYLES = ("sky", "window")
 
 
 class SkybgError(Exception):
@@ -177,7 +185,7 @@ def get_location():
 # ---------- weather ----------
 
 def uses_weather():
-    return load_config()["weather"] and current_style() == "sky"
+    return load_config()["weather"] and current_style() in WEATHER_STYLES
 
 
 def get_weather(lat, lon):
@@ -1345,6 +1353,444 @@ def render_cyanotype(out_path, width, height, t_utc, lat, lon, colors):
     os.replace(temporary, out_path)
 
 
+# ---------- gradient style ----------
+#
+# A plain gradient, but one that knows where the sun is. It is not a picture
+# of the sky: it is light falling off from a source. The source stands far
+# off the screen in the sun's direction, so the gradient turns once a day
+# like the shadow on a sundial — lit from the left at sunrise, from above at
+# noon, from the right at sunset and from below at night — and its colours
+# run from the colour of the light to the colour of what the light has not
+# reached. The colours are the style's own, tinted by the theme.
+
+# Sun elevation, then five colours from the lit end of the screen to the far
+# end. Dawn runs pink and cool, dusk gold and red, as in bokashi.
+GRADIENT_NIGHT = [(-18, "34407a", "262f62", "1a2149", "121736", "0c0f26")]
+GRADIENT_TWILIGHT = {
+    "dawn": [
+        (-10, "6a5a96", "433f80", "2a2d62", "1a1e48", "0f1332"),
+        (-4, "f2a493", "cf7c9f", "8c69b0", "4d569f", "263670"),
+        (0.5, "ffd6a3", "f79c90", "c97db3", "7d7cc9", "3f5cb0"),
+        (7, "ffedc6", "f8c6ac", "d6a8cc", "8ba6e2", "4c7bd0"),
+    ],
+    "dusk": [
+        (-10, "7c4f84", "4b3c7c", "2c2b60", "1a1d47", "0f1231"),
+        (-4, "f08a5e", "c9567c", "7c4a98", "3e3a86", "1e2459"),
+        (0.5, "ffc06e", "f47b55", "c14d85", "6c4ba5", "2e3a8d"),
+        (7, "ffdf9c", "f8aa6c", "e07d8e", "8b79c8", "4068c0"),
+    ],
+}
+GRADIENT_DAY = [
+    (18, "ffefc8", "f0dde6", "a3c6f0", "5591e5", "3a5fc6"),
+    (40, "fff6dc", "dcecfa", "86c3f7", "418cee", "3058d0"),
+]
+GRADIENT_SHEETS = ("fffaf0", "1a2149")   # the lightest of the day, the middle of the night
+GRADIENT_GRID = 64            # the field is this many cells across before it is enlarged
+GRADIENT_LEAN = 0.6           # how far a low sun tips the gradient onto its side
+GRADIENT_LIFT = 0.35          # holds the light overhead a while past sunset
+GRADIENT_DISTANCE = 2.5       # of the screen's height, from its centre to the light
+GRADIENT_REACH = 0.75         # below 1, the light gives way to colour sooner
+GRADIENT_DARK_DEPTH = 0.96    # lightness under a dark theme, against dark windows
+
+
+def cubic_ramp(stops, t):
+    """A smooth curve through evenly spaced `stops` (tuples) at `t` in 0..1,
+    shape-preserving, so the bands of a gradient meet without creases."""
+    last = len(stops) - 1
+    t = clamp(t) * last
+    i = min(int(t), last - 1)
+    a, b, c, d = stops[max(i - 1, 0)], stops[i], stops[i + 1], stops[min(i + 2, last)]
+    out = []
+    for k in range(len(b)):
+        rise = c[k] - b[k]
+        m0 = pchip_slope(b[k] - a[k], rise, 1, 1) if i > 0 else rise
+        m1 = pchip_slope(rise, d[k] - c[k], 1, 1) if i + 1 < last else rise
+        out.append(hermite(b[k], c[k], m0, m1, 1, t - i))
+    return tuple(out)
+
+
+def gradient_ramp(elev, morning):
+    """The five colours (Oklab), lit end first, for a sun elevation."""
+    keys = GRADIENT_NIGHT + GRADIENT_TWILIGHT["dawn" if morning else "dusk"] + GRADIENT_DAY
+    elev = clamp(elev, keys[0][0], keys[-1][0])
+    k = max(i for i in range(len(keys) - 1) if elev >= keys[i][0])
+    low, high = keys[k], keys[k + 1]
+    t = smoothstep(low[0], high[0], elev)
+    return [lerp(srgb_to_oklab(hexrgb(low[i])), srgb_to_oklab(hexrgb(high[i])), t)
+            for i in range(1, 6)]
+
+
+def gradient_light(elev, az, lat):
+    """The direction of the light on the screen, as a unit vector (x right,
+    y up): the sun's direction seen facing its side of the sky — south in
+    the northern hemisphere, north in the southern — with east and west
+    drawn in a little, so the gradient leans rather than lies down."""
+    side = -1 if lat >= 0 else 1
+    x = side * math.sin(math.radians(az)) * math.cos(math.radians(elev)) * GRADIENT_LEAN
+    y = math.sin(math.radians(elev)) + GRADIENT_LIFT
+    length = math.hypot(x, y)
+    return (x / length, y / length) if length > 1e-6 else (0.0, 1.0)
+
+
+def gradient_field(elev, az, lat, aspect):
+    """Rows of values 0..1 — 0 nearest the light, 1 farthest — on a small
+    grid of the screen's proportions."""
+    gw = GRADIENT_GRID
+    gh = max(2, round(gw / aspect))
+    dx, dy = gradient_light(elev, az, lat)
+    lx, ly = dx * GRADIENT_DISTANCE, dy * GRADIENT_DISTANCE
+    rows = [[math.hypot((gx / (gw - 1) - 0.5) * aspect - lx, 0.5 - gy / (gh - 1) - ly)
+             for gx in range(gw)] for gy in range(gh)]
+    near, far = min(map(min, rows)), max(map(max, rows))
+    return [[((r - near) / (far - near)) ** GRADIENT_REACH for r in row] for row in rows]
+
+
+def render_gradient(out_path, width, height, t_utc, lat, lon, colors):
+    elev, az = solar_position(lat, lon, t_utc)
+    ramp = gradient_ramp(elev, az < 180)
+    tint = theme_tint(colors, *GRADIENT_SHEETS)
+    depth = 1.0 if is_light(colors) else GRADIENT_DARK_DEPTH
+    field = gradient_field(elev, az, lat, width / height)
+    ppm_path = os.path.join(STATE_DIR, "gradient.ppm")
+    with open(ppm_path, "wb") as f:
+        f.write(f"P6\n{len(field[0])} {len(field)}\n65535\n".encode())
+        for row in field:
+            for value in row:
+                lab = cubic_ramp(ramp, value)
+                color = oklab_to_srgb(tint((lab[0] * depth, lab[1], lab[2])))
+                f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in color)))
+    temporary = out_path + ".tmp.png"
+    subprocess.run([which("magick"), ppm_path, "-resize", f"{width}x{height}!",
+                    "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8", temporary],
+                   check=True, timeout=60)
+    os.replace(temporary, out_path)
+
+
+# ---------- slitscan style ----------
+#
+# A whole day in one picture, the way a slit-scan camera makes one: every
+# column of the screen is the sky at a different moment. Now is the middle
+# column; the twelve hours gone run out to the left edge and the twelve to
+# come to the right, so the night is as wide as the night is long, and the
+# picture slides a column to the left every few minutes. Each column is the
+# sky style's sky for its moment, from the zenith at the top down to the
+# horizon, in the theme's colours, without the weather.
+
+SLITSCAN_HOURS = 24.0         # the span of time across the screen
+SLITSCAN_GRID = (192, 40)
+SLITSCAN_SUNWARD = 0.65       # how far each horizon leans to its sunward colour
+
+
+def slitscan_hour(x):
+    """Hours from now, negative for the past, at `x` across the screen (0..1)."""
+    return (x - 0.5) * SLITSCAN_HOURS
+
+
+def sky_column(c, elev, rows):
+    """The sky style's clear sky for a sun elevation as one column of
+    colours, zenith first: the far and sunward horizons mixed into one."""
+    zenith, far, near = sky_stops(elev, c)
+    horizon = lerp(far, near, SLITSCAN_SUNWARD)
+    night = c.get("darker_background", c["background"])
+    height = 18.0 + 30.0 * clamp(elev / 30)
+    brightness = clamp((elev + 18) / 18)
+    column = []
+    for row in range(rows):
+        v = math.exp(-ALT_TOP * (1 - row / (rows - 1)) / height)
+        column.append(lerp(night, lerp(zenith, horizon, v), brightness + (1 - brightness) * v))
+    return column
+
+
+def render_slitscan(out_path, width, height, t_utc, lat, lon, colors):
+    gw, gh = SLITSCAN_GRID
+    columns = []
+    for gx in range(gw):
+        moment = t_utc + datetime.timedelta(hours=slitscan_hour(gx / (gw - 1)))
+        columns.append(sky_column(colors, solar_position(lat, lon, moment)[0], gh))
+    ppm_path = os.path.join(STATE_DIR, "slitscan.ppm")
+    with open(ppm_path, "wb") as f:
+        f.write(f"P6\n{gw} {gh}\n65535\n".encode())
+        for row in range(gh):
+            for column in columns:
+                f.write(struct.pack(">HHH", *(round(clamp(v) * 65535) for v in column[row])))
+    temporary = out_path + ".tmp.png"
+    subprocess.run([which("magick"), ppm_path, "-resize", f"{width}x{height}!",
+                    "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8", temporary],
+                   check=True, timeout=60)
+    os.replace(temporary, out_path)
+
+
+# ---------- window style ----------
+#
+# Not the sky but what it does indoors: a bare room, seen from where its
+# window wall would be, looking at the wall the window faces. The window
+# faces the sun's side of the sky and the sun throws its panes into the room
+# as it really would. Each point of each surface looks back along the light
+# to see whether glass or bar is in the way, so the shapes are the true ones:
+# upright on the far wall when the sun is low, sliding down it and out
+# across the floor as the sun climbs, sheared along a side wall when the
+# light comes from round to one side. Light that only grazes a surface lies
+# on it thinly. Edges blur with the length of the ray, the grey of the sky
+# comes in through the same window and falls away into the corners, and what
+# the sun lights lights the rest of the room in its turn, in its own colour.
+# Cloud softens the panes and then puts them out. At night the moon does the
+# same, faintly, by its phase. The one liberty: light from far round to the
+# side is turned back toward the room, or a summer sunrise, which comes from
+# behind the window's wall, would not come in at all.
+
+# The room in the dark, in the shade by day, and in the sun when it is low
+# and when it is high; then in moonlight. The theme chooses the stock.
+WINDOW_INKS = {
+    "dark": ("161d30", "46547a", "f5823f", "f7e3c0", "8a9cc8"),
+    "light": ("8189a0", "d2cec4", "f6a468", "fffaf0", "c9d3ea"),
+}
+WINDOW_SHEETS = ("fffaf0", "161d30")   # the sunlit wall, and the room at night
+WINDOW_ROOM = (2.2, 1.5)      # the room's width and depth, in its own heights
+WINDOW_GLASS = (0.9, 0.14, 0.9)   # the window's width, and its sill and head above the floor
+WINDOW_PANES = (3, 3)         # across and up
+WINDOW_BAR = 0.034            # the glazing bars' thickness
+WINDOW_EYE = (1.5, 0.7)       # how far behind the window's wall the eye stands, and how high
+WINDOW_FLOOR = 0.42           # how much of the screen's height the floor takes, below the wall
+WINDOW_SWING = 65.0           # the widest the light may come in from the side, in degrees
+WINDOW_SUN_WIDTH = 0.04       # the sun's disc in radians, and more for the glass:
+                              # what softens a shadow's edge, more the further it is thrown
+WINDOW_CLOUD_WIDTH = 0.12     # how much wider a full cloud cover makes the source
+WINDOW_HAZE = (0.3, 0.14)     # the share of the light that comes from the glow round the
+                              # sun rather than its disc, and that glow's width in radians
+WINDOW_GRAZE = 0.5            # how gently light dims as it slants: 1 is Lambert's law
+WINDOW_SKY = 9.0              # how strongly the sky's light through the window fills the room
+WINDOW_BOUNCE = 5.0           # how strongly what the sun lights lights the rest
+WINDOW_MOONLIGHT = 0.3        # the full moon's patch, against the sun's
+WINDOW_SCALE = 4              # the room is rendered at this fraction of the screen
+WINDOW_GLOW_SCALE = 3         # and its indirect light at this fraction of that
+
+
+def window_bearing(az, lat):
+    """The light's bearing off the window's own, in degrees, east negative
+    for a south window: the window faces south in the northern hemisphere and
+    north in the southern. Near the window's own bearing it is the true one;
+    toward the sides it is eased, never passing WINDOW_SWING, so that a sun
+    far round to the east or west still comes in."""
+    facing = 180 if lat >= 0 else 0
+    return WINDOW_SWING * math.tanh(((az - facing + 180) % 360 - 180) / WINDOW_SWING)
+
+
+def window_light(alt, bearing):
+    """The unit vector from the room toward the light: x to the right as the
+    eye sees it, y away from the window into the room, z up. The eye has the
+    window at its back, so a morning sun is at its right shoulder in the
+    northern hemisphere and throws its light to the left."""
+    a, b = math.radians(alt), math.radians(bearing)
+    return (-math.sin(b) * math.cos(a), -math.cos(b) * math.cos(a), math.sin(a))
+
+
+def window_view(u, v):
+    """What the eye sees through a point of the screen, `u` to the right of
+    its centre and `v` above, in screen heights: (point of the room, the
+    surface's normal there). The floor is z = 0 and the window's wall y = 0.
+    The eye looks level, as an architect's camera does, so that uprights
+    stay upright, and the picture is slid up until the floor runs from the
+    window's wall at the screen's foot to the far wall WINDOW_FLOOR above it."""
+    width, depth = WINDOW_ROOM
+    back, eye = WINDOW_EYE
+    focal = WINDOW_FLOOR / (eye / back - eye / (depth + back))
+    v -= focal * eye / back - 0.5
+    reach, normal = (depth + back) / focal, (0.0, -1.0, 0.0)
+    if v < 0 and eye / -v < reach:
+        reach, normal = eye / -v, (0.0, 0.0, 1.0)
+    if v > 0 and (1 - eye) / v < reach:
+        reach, normal = (1 - eye) / v, (0.0, 0.0, -1.0)
+    if u and width / 2 / abs(u) < reach:
+        reach, normal = width / 2 / abs(u), (-math.copysign(1.0, u), 0.0, 0.0)
+    return (u * reach, focal * reach - back, eye + v * reach), normal
+
+
+def window_landing(x, z, light):
+    """Where light through a point of the glass lands: (point, normal)."""
+    width, depth = WINDOW_ROOM
+    dx, dy, dz = -light[0], -light[1], -light[2]
+    reach, normal = depth / dy, (0.0, -1.0, 0.0)
+    if dz < 0 and z / -dz < reach:
+        reach, normal = z / -dz, (0.0, 0.0, 1.0)
+    if dx and (width / 2 - math.copysign(x, dx)) / abs(dx) < reach:
+        reach, normal = (width / 2 - math.copysign(x, dx)) / abs(dx), (-math.copysign(1.0, dx), 0.0, 0.0)
+    return (x + dx * reach, dy * reach, z + dz * reach), normal
+
+
+def pane_cover(u, low, high, count, bar, soft):
+    """How much of a source `soft` wide, centred at `u`, shows through
+    `count` panes dividing `low`..`high`, with bars `bar` thick between."""
+    if not low - soft / 2 < u < high + soft / 2:
+        return 0.0
+    pitch = (high - low) / count
+    total = 0.0
+    for k in range(count):
+        a, b = low + k * pitch + bar / 2, low + (k + 1) * pitch - bar / 2
+        total += smoothstep(-0.5, 0.5, (u - a) / soft) - smoothstep(-0.5, 0.5, (u - b) / soft)
+    return total
+
+
+def window_sources(cloud):
+    """The light as ((share, angular width), ...): the sun's disc and the
+    glow of the air round it, so an edge has a narrow blur inside a wide
+    faint one. Cloud widens both and moves light from the disc to the glow."""
+    haze, haze_width = WINDOW_HAZE
+    haze += (1 - haze) * 0.6 * cloud
+    return ((1 - haze, WINDOW_SUN_WIDTH + WINDOW_CLOUD_WIDTH * cloud),
+            (haze, haze_width + WINDOW_CLOUD_WIDTH * cloud))
+
+
+def window_trace(point, light):
+    """Back along the light from a point of the room to the window's wall:
+    (distance across the wall from the window's middle, height up it, length
+    of the ray), or None if the light does not come from the window's side."""
+    if light[1] > -0.02 or point[1] <= 0:
+        return None
+    ray = point[1] / -light[1]
+    return point[0] + light[0] * ray, point[2] + light[2] * ray, ray
+
+
+def window_cover(x, z, ray, sources, grain=(0.0, 0.0)):
+    """How much of the light shows through the panes, 0..1, from the far
+    end of a ray traced back to (`x`, `z`) on the window's wall. The edges
+    blur by the ray's length, and by `grain`, the size across and up the
+    wall of what one cell of the picture takes in."""
+    width, sill, head = WINDOW_GLASS
+    across, up = WINDOW_PANES
+    total = 0.0
+    for share, wide in sources:
+        soft = max(wide * ray, 0.012)
+        rise = pane_cover(z, sill, head, up, WINDOW_BAR, soft + grain[1])
+        if rise > 0.0005:
+            total += share * rise * pane_cover(x, -width / 2, width / 2, across, WINDOW_BAR,
+                                               soft + grain[0])
+    return total
+
+
+def window_lamps(light=None):
+    """The panes as lamps, [(point, normal, power)]. With no `light` they
+    are the panes themselves, glowing with the sky; with one, they are the
+    places in the room where its light through each pane lands, which shine
+    back by as much as came through the glass."""
+    width, sill, head = WINDOW_GLASS
+    across, up = WINDOW_PANES
+    area = width * (head - sill) / (across * up)
+    lamps = []
+    for i in range(across):
+        for k in range(up):
+            x, z = ((i + 0.5) / across - 0.5) * width, sill + (k + 0.5) / up * (head - sill)
+            if light is None:
+                lamps.append(((x, 0.0, z), (0.0, 1.0, 0.0), area))
+            elif light[1] < -0.02:
+                lamps.append((*window_landing(x, z, light), area * -light[1]))
+    return lamps
+
+
+def window_glow(point, normal, lamps):
+    """The light a point of the room gets from a set of lamps: each shines
+    most straight out from its surface, falls off with the square of the
+    distance, and lights best what faces it."""
+    total = 0.0
+    for at, facing, power in lamps:
+        dx, dy, dz = point[0] - at[0], point[1] - at[1], point[2] - at[2]
+        r2 = dx * dx + dy * dy + dz * dz + 0.1
+        out = dx * facing[0] + dy * facing[1] + dz * facing[2]
+        into = -(dx * normal[0] + dy * normal[1] + dz * normal[2])
+        if out > 0 and into > 0:
+            total += power * out * into / (math.pi * r2 * r2)
+    return total
+
+
+def sample_grid(rows, u, v):
+    """The grid's value at fractions `u` across and `v` down, between cells."""
+    x = clamp(u * len(rows[0]) - 0.5, 0, len(rows[0]) - 1.001)
+    y = clamp(v * len(rows) - 0.5, 0, len(rows) - 1.001)
+    x0, y0 = int(x), int(y)
+    fx, fy = x - x0, y - y0
+    top = rows[y0][x0] * (1 - fx) + rows[y0][x0 + 1] * fx
+    bottom = rows[y0 + 1][x0] * (1 - fx) + rows[y0 + 1][x0 + 1] * fx
+    return top * (1 - fy) + bottom * fy
+
+
+def window_strengths(elev, moon_alt, moon_fraction, cloud):
+    """(ambient, sun, moon): how much daylight fills the room, and how
+    strongly the sun and the moon each throw the window into it."""
+    clear = (1 - cloud) ** 1.5
+    ambient = smoothstep(-9, 8, elev) * (1 - 0.2 * cloud)
+    sun = smoothstep(-0.8, 2, elev) * clear
+    moon = (WINDOW_MOONLIGHT * moon_fraction * smoothstep(0, 8, moon_alt)
+            * smoothstep(-5, -12, elev) * clear)
+    return ambient, sun, moon
+
+
+def render_window(out_path, width, height, t_utc, lat, lon, cloud, fog, colors):
+    if fog:
+        cloud = max(cloud, 0.9)
+    elev, az = solar_position(lat, lon, t_utc)
+    moon_alt, moon_az, fraction, _ = moon_position(lat, lon, t_utc)
+    ambient, sun, moon = window_strengths(elev, moon_alt, fraction, cloud)
+    tint = theme_tint(colors, *WINDOW_SHEETS)
+    night, shade, low, high, moonlit = (
+        tint(srgb_to_oklab(hexrgb(ink))) for ink in WINDOW_INKS["light" if is_light(colors) else "dark"])
+    sunlit = lerp(low, high, smoothstep(0, 28, elev))
+    sources = window_sources(cloud)
+    # (strength, colour, direction) of each light that is up
+    lights = [(strength, ink, window_light(max(alt, 0.3), window_bearing(bearing, lat)))
+              for strength, ink, alt, bearing in ((sun, sunlit, elev, az), (moon, moonlit, moon_alt, moon_az))
+              if strength > 0.002]
+
+    aspect = width / height
+    gw, gh = max(48, width // WINDOW_SCALE), max(30, height // WINDOW_SCALE)
+    # The indirect light is smooth, and so is worked out on a coarser grid:
+    # the sky's through the panes, then what each light's patch gives back.
+    cw, ch = max(16, gw // WINDOW_GLOW_SCALE), max(10, gh // WINDOW_GLOW_SCALE)
+    lamp_sets = [window_lamps()] + [window_lamps(light) for _, _, light in lights]
+    glows = [[] for _ in lamp_sets]
+    for cy in range(ch):
+        views = [window_view(((cx + 0.5) / cw - 0.5) * aspect, 0.5 - (cy + 0.5) / ch) for cx in range(cw)]
+        for glow, lamps in zip(glows, lamp_sets):
+            glow.append([window_glow(point, normal, lamps) for point, normal in views])
+
+    def view_row(gy):
+        return [window_view(((gx + 0.5) / gw - 0.5) * aspect, 0.5 - (gy + 0.5) / gh)
+                for gx in range(gw + 1)]
+
+    out = bytearray()
+    below = view_row(0)
+    for gy in range(gh):
+        fy = (gy + 0.5) / gh
+        views, below = below, view_row(gy + 1)
+        for gx in range(gw):
+            fx = (gx + 0.5) / gw
+            point, normal = views[gx]
+            sky = WINDOW_SKY * sample_grid(glows[0], fx, fy)
+            lab = lerp(night, shade, ambient * (0.3 + 0.7 * sky / (1 + sky)))
+            for (strength, ink, light), glow in zip(lights, glows[1:]):
+                bounce = WINDOW_BOUNCE * strength * sample_grid(glow, fx, fy)
+                lab = lerp(lab, ink, bounce / (1 + bounce))
+                facing = normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]
+                trace = window_trace(point, light) if facing > 0 else None
+                if trace:
+                    # A cell of the picture takes in a stretch of the room, and
+                    # so of the window, most where it looks along the floor.
+                    beside = window_trace(views[gx + 1][0], light) or trace
+                    under = window_trace(below[gx][0], light) or trace
+                    grain = (abs(beside[0] - trace[0]) + abs(under[0] - trace[0]),
+                             abs(beside[1] - trace[1]) + abs(under[1] - trace[1]))
+                    direct = strength * window_cover(*trace, sources, grain)
+                    if direct > 0:
+                        lab = lerp(lab, ink, direct * facing ** WINDOW_GRAZE)
+            out += struct.pack(">HHH", *(round(clamp(v) * 65535) for v in oklab_to_srgb(lab)))
+    ppm_path = os.path.join(STATE_DIR, "window.ppm")
+    with open(ppm_path, "wb") as f:
+        f.write(f"P6\n{gw} {gh}\n65535\n".encode() + bytes(out))
+    temporary = out_path + ".tmp.png"
+    subprocess.run([which("magick"), ppm_path, "-resize", f"{width}x{height}!",
+                    "-attenuate", "0.25", "+noise", "Gaussian", "-depth", "8", temporary],
+                   check=True, timeout=60)
+    os.replace(temporary, out_path)
+
+
 def screen_size():
     if IS_MAC:
         try:
@@ -1385,6 +1831,15 @@ def render_sky(out_path, width, height, t_utc, lat, lon, cloud, fog, colors):
         return elev, az
     if current_style() == "cyanotype":
         render_cyanotype(out_path, width, height, t_utc, lat, lon, colors)
+        return elev, az
+    if current_style() == "gradient":
+        render_gradient(out_path, width, height, t_utc, lat, lon, colors)
+        return elev, az
+    if current_style() == "window":
+        render_window(out_path, width, height, t_utc, lat, lon, cloud, fog, colors)
+        return elev, az
+    if current_style() == "slitscan":
+        render_slitscan(out_path, width, height, t_utc, lat, lon, colors)
         return elev, az
     pixels = sky_field(colors, elev, az, cloud, fog)
 
@@ -1614,7 +2069,7 @@ def timer_disable():
 # ---------- commands ----------
 
 def weather_words(cloud, fog):
-    if current_style() != "sky":
+    if current_style() not in WEATHER_STYLES:
         return f"{current_style()} style"
     if fog:
         return "fog"
@@ -1792,6 +2247,12 @@ def run(args):
                 lat, lon, datetime.datetime.now(datetime.timezone.utc))
             print(f"moon: {alt:+.1f}° elevation, {bearing:.0f}° azimuth, {round(fraction * 100)}% lit, "
                   f"{'waxing' if waxing else 'waning'} — weather not used")
+        elif style in ("gradient", "slitscan"):
+            print("weather not used")
+        elif style == "window":
+            alt, _, fraction, _ = moon_position(lat, lon, datetime.datetime.now(datetime.timezone.utc))
+            print(f"weather: {weather_words(cloud, fog)} — moon {alt:+.1f}° elevation, "
+                  f"{round(fraction * 100)}% lit")
         else:
             print(f"weather: {weather_words(cloud, fog)} — stars {'visible' if stars else 'hidden'}")
         print(f"timer: {'active' if timer_active() else 'inactive'}")

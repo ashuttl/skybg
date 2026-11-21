@@ -587,6 +587,206 @@ class DaylightTests(unittest.TestCase):
         line, washes = skybg.cyanotype_inks(self.theme("#cdd4bb"))
         self.assertLess(line[0], washes[0][0] - 0.3)
 
+    def test_gradient_turns_with_the_sun(self):
+        # Lit from the left at a northern sunrise, from above at noon, from the
+        # right at sunset, from below at night; mirrored facing north.
+        self.assertLess(skybg.gradient_light(0, 90, 43.7)[0], -0.5)
+        self.assertGreater(skybg.gradient_light(0, 270, 43.7)[0], 0.5)
+        self.assertGreater(skybg.gradient_light(0, 90, -33.9)[0], 0.5)
+        self.assertAlmostEqual(skybg.gradient_light(60, 180, 43.7)[0], 0)
+        self.assertAlmostEqual(skybg.gradient_light(60, 180, 43.7)[1], 1)
+        self.assertLess(skybg.gradient_light(-60, 0, 43.7)[1], -0.99)
+        for elev, az in ((-20, 300), (5, 120), (-90, 0)):
+            self.assertAlmostEqual(math.hypot(*skybg.gradient_light(elev, az, 43.7)), 1)
+
+    def test_gradient_field_runs_from_the_light(self):
+        field = skybg.gradient_field(50, 180, 43.7, 1.6)
+        self.assertEqual(len(field[0]), skybg.GRADIENT_GRID)
+        values = [v for row in field for v in row]
+        self.assertEqual((min(values), max(values)), (0.0, 1.0))
+        # Noon: the light is overhead, so the top is nearer it than the bottom.
+        self.assertLess(field[0][32], field[-1][32])
+        morning = skybg.gradient_field(5, 110, 43.7, 1.6)
+        self.assertLess(morning[20][0], morning[20][-1])
+
+    def test_gradient_ramp_is_smooth_and_in_gamut(self):
+        stops = [(0.0,), (1.0,), (1.0,), (3.0,)]
+        self.assertEqual(skybg.cubic_ramp(stops, 0), (0.0,))
+        self.assertEqual(skybg.cubic_ramp(stops, 1), (3.0,))
+        self.assertAlmostEqual(skybg.cubic_ramp(stops, 1 / 3)[0], 1.0)
+        self.assertAlmostEqual(skybg.cubic_ramp(stops, 0.5)[0], 1.0)   # no overshoot on the flat
+        for morning in (True, False):
+            previous = None
+            for elev in (-40, -18, -10, -4, 0.5, 7, 18, 40, 80):
+                ramp = skybg.gradient_ramp(elev, morning)
+                # The lit end is the lightest, and the day is lighter than the night.
+                self.assertGreater(ramp[0][0], ramp[-1][0])
+                if previous:
+                    self.assertGreaterEqual(ramp[0][0], previous - 1e-9)
+                previous = ramp[0][0]
+                for k in range(21):
+                    color = skybg.oklab_to_srgb(skybg.cubic_ramp(ramp, k / 20))
+                    self.assertTrue(all(-0.01 <= v <= 1.01 for v in color), (elev, k, color))
+        self.assertEqual(skybg.gradient_ramp(-30, True), skybg.gradient_ramp(-30, False))
+        self.assertNotEqual(skybg.gradient_ramp(0, True), skybg.gradient_ramp(0, False))
+
+    def test_window_faces_the_sun_and_eases_the_sides(self):
+        self.assertEqual(skybg.window_bearing(180, 43.7), 0)
+        self.assertEqual(skybg.window_bearing(0, -33.9), 0)
+        self.assertAlmostEqual(skybg.window_bearing(170, 43.7), -10, delta=0.2)
+        self.assertLess(skybg.window_bearing(120, 43.7), -40)
+        # A summer sunrise, behind the wall, still comes in, and from the east.
+        self.assertGreater(skybg.window_bearing(57, 43.7), -skybg.WINDOW_SWING)
+        self.assertLess(skybg.window_bearing(57, 43.7), -55)
+
+    def test_window_light_comes_over_the_shoulder(self):
+        # x to the eye's right, y into the room, z up. The sun is behind the
+        # eye; a morning sun, east of a south window, is at its right.
+        x, y, z = skybg.window_light(45, 0)
+        self.assertAlmostEqual(x, 0)
+        self.assertAlmostEqual(y, -math.sqrt(0.5))
+        self.assertAlmostEqual(z, math.sqrt(0.5))
+        self.assertGreater(skybg.window_light(20, -30)[0], 0.3)
+        self.assertLess(skybg.window_light(20, 30)[0], -0.3)
+        self.assertAlmostEqual(math.hypot(*skybg.window_light(20, -30)), 1)
+
+    def test_window_view_is_a_room(self):
+        width, depth = skybg.WINDOW_ROOM
+        # Straight ahead is the far wall; the foot of the screen is the floor
+        # at the window's wall, and the floor meets the far wall WINDOW_FLOOR up.
+        point, normal = skybg.window_view(0.0, 0.2)
+        self.assertEqual(normal, (0.0, -1.0, 0.0))
+        self.assertAlmostEqual(point[1], depth)
+        self.assertTrue(0 < point[2] < 1)
+        point, normal = skybg.window_view(0.0, -0.5)
+        self.assertEqual(normal, (0.0, 0.0, 1.0))
+        self.assertAlmostEqual(point[1], 0.0)
+        self.assertAlmostEqual(point[2], 0.0)
+        point, normal = skybg.window_view(0.0, -0.5 + skybg.WINDOW_FLOOR)
+        self.assertAlmostEqual(point[1], depth)
+        self.assertAlmostEqual(point[2], 0.0)
+        # Far to either side, the side walls, facing in.
+        point, normal = skybg.window_view(0.79, 0.2)
+        self.assertEqual(normal, (-1.0, 0.0, 0.0))
+        self.assertAlmostEqual(point[0], width / 2)
+        self.assertEqual(skybg.window_view(-0.79, 0.2)[1], (1.0, 0.0, 0.0))
+        # Uprights stay upright: up the screen, the far wall's x does not move.
+        self.assertAlmostEqual(skybg.window_view(0.3, 0.0)[0][0], skybg.window_view(0.3, 0.3)[0][0])
+
+    def test_window_trace_and_landing_agree(self):
+        # A point a metre into the room on the floor, sun at 45 degrees
+        # straight in, is lit through the glass a metre up.
+        x, z, ray = skybg.window_trace((0.3, 1.0, 0.0), skybg.window_light(45, 0))
+        self.assertAlmostEqual(x, 0.3)
+        self.assertAlmostEqual(z, 1.0)
+        self.assertAlmostEqual(ray, math.sqrt(2))
+        # Light from behind the window's wall does not come in.
+        self.assertIsNone(skybg.window_trace((0.3, 1.0, 0.0), (0.5, 0.5, 0.7)))
+        # A low sun reaches the far wall, a high one the floor, one from the
+        # side a side wall; and looking back from there finds the same glass.
+        width, depth = skybg.WINDOW_ROOM
+        for alt, bearing, facing in ((8, 0, (0.0, -1.0, 0.0)), (60, 10, (0.0, 0.0, 1.0)),
+                                     (8, -60, (1.0, 0.0, 0.0)), (8, 60, (-1.0, 0.0, 0.0))):
+            light = skybg.window_light(alt, bearing)
+            point, normal = skybg.window_landing(0.1, 0.5, light)
+            self.assertEqual(normal, facing, (alt, bearing))
+            x, z, _ = skybg.window_trace(point, light)
+            self.assertAlmostEqual(x, 0.1)
+            self.assertAlmostEqual(z, 0.5)
+        # A morning sun throws its light to the eye's left.
+        self.assertLess(skybg.window_landing(0.0, 0.5, skybg.window_light(30, -20))[0][0], 0)
+
+    def test_window_panes_and_bars(self):
+        cover = lambda u, soft=0.001: skybg.pane_cover(u, 0.0, 0.9, 3, 0.02, soft)
+        self.assertAlmostEqual(cover(0.15), 1.0)       # the middle of a pane
+        self.assertAlmostEqual(cover(0.3), 0.0)        # a bar
+        self.assertAlmostEqual(cover(-0.1), 0.0)       # the wall
+        self.assertAlmostEqual(cover(1.0), 0.0)
+        # A wide source sees past the bar: the shadow fills in.
+        self.assertGreater(cover(0.3, soft=0.2), 0.8)
+
+    def test_window_edges_soften_with_distance_haze_and_cloud(self):
+        width, sill, head = skybg.WINDOW_GLASS
+        up = skybg.WINDOW_PANES[1]
+        middle = sill + (head - sill) / up / 2          # the middle of a pane, up the wall
+        clear = skybg.window_sources(0.0)
+        self.assertAlmostEqual(sum(share for share, _ in clear), 1.0)
+        self.assertAlmostEqual(sum(share for share, _ in skybg.window_sources(1.0)), 1.0)
+        self.assertGreater(skybg.window_sources(0.8)[0][1], clear[0][1])
+        self.assertAlmostEqual(skybg.window_cover(0.0, middle, 0.2, clear), 1.0, delta=0.02)
+        self.assertEqual(skybg.window_cover(width, middle, 0.2, clear), 0.0)
+        # Just outside the glass: dark by a short ray, half-lit by a long one.
+        edge = width / 2 + 0.03
+        near, far = (skybg.window_cover(edge, middle, ray, clear) for ray in (0.2, 3.0))
+        self.assertLess(near, 0.05)
+        self.assertGreater(far, near + 0.1)
+        with mock.patch.object(skybg, "WINDOW_HAZE", (0.0, 0.1)):
+            self.assertLess(skybg.window_cover(edge + 0.1, middle, 3.0, skybg.window_sources(0.0)),
+                            skybg.window_cover(edge + 0.1, middle, 3.0, clear))
+        # What a cell of the picture takes in softens an edge too.
+        self.assertGreater(skybg.window_cover(edge, middle, 0.2, clear, (0.2, 0.0)), near)
+
+    def test_window_lights_the_room(self):
+        self.assertAlmostEqual(skybg.sample_grid([[0.0, 1.0], [0.0, 1.0]], 0.5, 0.5), 0.5)
+        self.assertEqual(skybg.sample_grid([[0.0, 1.0], [0.0, 1.0]], 0.0, 0.0), 0.0)
+        width, depth = skybg.WINDOW_ROOM
+        sky = skybg.window_lamps()
+        self.assertEqual(len(sky), skybg.WINDOW_PANES[0] * skybg.WINDOW_PANES[1])
+        # The sky's light is strongest on the floor under the window, weaker
+        # on the far wall, and weakest in a far corner.
+        under = skybg.window_glow((0.0, 0.4, 0.0), (0.0, 0.0, 1.0), sky)
+        wall = skybg.window_glow((0.0, depth, 0.5), (0.0, -1.0, 0.0), sky)
+        corner = skybg.window_glow((width / 2 - 0.05, depth, 0.05), (0.0, -1.0, 0.0), sky)
+        self.assertGreater(under, wall)
+        self.assertGreater(wall, corner)
+        self.assertGreater(corner, 0)
+        # A high sun's patch on the floor lights the far wall, but not the
+        # floor it lies on; and less comes through the glass aslant.
+        patch = skybg.window_lamps(skybg.window_light(50, 0))
+        self.assertTrue(all(normal == (0.0, 0.0, 1.0) for _, normal, _ in patch))
+        self.assertGreater(skybg.window_glow((0.0, depth, 0.5), (0.0, -1.0, 0.0), patch), 0)
+        self.assertEqual(skybg.window_glow((0.5, 1.0, 0.0), (0.0, 0.0, 1.0), patch), 0.0)
+        self.assertLess(sum(p for _, _, p in skybg.window_lamps(skybg.window_light(50, 60))),
+                        sum(p for _, _, p in patch))
+        self.assertEqual(skybg.window_lamps((0.5, 0.5, 0.7)), [])
+
+    def test_window_weather_and_moon(self):
+        ambient, sun, moon = skybg.window_strengths(30, -20, 1.0, 0.0)
+        self.assertGreater(sun, 0.9)
+        self.assertEqual(moon, 0.0)
+        self.assertEqual(skybg.window_strengths(30, -20, 1.0, 1.0)[1], 0.0)
+        self.assertGreater(skybg.window_strengths(30, -20, 1.0, 1.0)[0], 0.5)
+        self.assertLess(skybg.window_strengths(30, -20, 1.0, 0.5)[1], sun / 2)
+        ambient, sun, moon = skybg.window_strengths(-40, 35, 1.0, 0.0)
+        self.assertEqual((ambient, sun), (0.0, 0.0))
+        self.assertAlmostEqual(moon, skybg.WINDOW_MOONLIGHT)
+        self.assertEqual(skybg.window_strengths(-40, 35, 0.0, 0.0)[2], 0.0)   # new moon
+        self.assertEqual(skybg.window_strengths(-40, -5, 1.0, 0.0)[2], 0.0)   # moon down
+
+    def test_slitscan_puts_now_in_the_middle(self):
+        self.assertEqual(skybg.slitscan_hour(0.5), 0)
+        self.assertEqual(skybg.slitscan_hour(0), -12)
+        self.assertEqual(skybg.slitscan_hour(1), 12)
+
+    def test_sky_column_runs_from_zenith_to_horizon(self):
+        colors = {name: skybg.hexrgb(value) for name, value in skybg.BASE_DEFAULTS["dark"].items()}
+        zenith, far, near = skybg.sky_stops(0, colors)
+        column = skybg.sky_column(colors, 0, 40)
+        self.assertEqual(len(column), 40)
+        for got, want in zip(column[-1], skybg.lerp(far, near, skybg.SLITSCAN_SUNWARD)):
+            self.assertAlmostEqual(got, want)
+        # Sunset is warm at the horizon; night is the theme's night all the way down.
+        self.assertGreater(column[-1][0] - column[-1][2], column[0][0] - column[0][2] + 0.2)
+        night = skybg.sky_column(colors, -40, 40)
+        self.assertLess(max(night[-1]), min(skybg.sky_column(colors, 40, 40)[-1]))
+
+    def test_only_weather_styles_ask_for_weather(self):
+        for style in skybg.STYLES:
+            with mock.patch.object(skybg, "load_config",
+                                   return_value={"location": "auto", "weather": True,
+                                                 "style": style}):
+                self.assertEqual(skybg.uses_weather(), style in ("sky", "window"))
+
     def test_daylight_never_asks_for_weather(self):
         with mock.patch.object(skybg, "load_config",
                                return_value={"location": "auto", "weather": True,

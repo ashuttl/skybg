@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add three styles. `gradient` is a plain gradient that turns with the sun
+  like the shadow on a sundial: lit from the sun's side of the screen, in
+  colours of its own that the theme tints. `window` is sunlight through a
+  window, its panes thrown into a bare room by the real sun — on the far wall
+  and red when it is low, on the floor and white when it is high — softened
+  and put out by cloud,
+  with the moon's at night; it uses the weather, as `sky` does. `slitscan` is
+  the whole day at once: each column of the screen is the sky at a different
+  hour, with now in the middle.
 - On macOS, run the launch agent with the Python 3.11+ that installed it.
   launchd's `PATH` finds only the system's Python 3.9, which could not even
   load the new styles, so every timer tick failed silently. `skybg doctor` now

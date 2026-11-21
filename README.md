@@ -64,7 +64,7 @@ skybg config show
 skybg config location LAT LON
 skybg config location auto
 skybg config weather on|off
-skybg config style sky|daylight|bokashi|cyanotype
+skybg config style sky|daylight|bokashi|cyanotype|gradient|window|slitscan
 ```
 
 Configuration lives at `${XDG_CONFIG_HOME:-~/.config}/skybg/config.json`.
@@ -108,8 +108,48 @@ background at night, and the line is its foreground; a light theme turns it
 into blue line on paper the colour of its background. It does not use the
 weather.
 
+`gradient` is a plain gradient that knows where the sun is. It does not
+picture the sky; it is light falling away from a source, and the source stands
+far off the screen in the sun's direction. So the gradient turns once a day,
+like the shadow on a sundial: lit from the left at sunrise, from overhead at
+noon, from the right at sunset, and from below through the night. Its colours
+run from the colour of the light to the colour of what the light has not
+reached — cream into blue at midday, gold through magenta into violet at
+dusk, pinker and cooler at dawn — blended in Oklab so the middle never goes
+muddy. The colours are its own, tinted by the theme like bokashi's inks. It
+does not use the weather.
+
+`window` leaves the sky out and shows what it does indoors: a bare room, seen
+from where its window wall would be, looking at the wall the window faces. The
+window faces the sun's side of the sky, and the sun throws its panes into the
+room as it really would, each point of the room looking back along the light
+to see whether glass or glazing bar is in the way. So the shapes are the true
+ones: upright on the far wall when the sun is low, sliding down it and folding
+out across the floor as the sun climbs, sheared along a side wall early and
+late — on the far wall for most of a December day, a bright strip of floor
+under the window in June. Light that only grazes a surface lies on it thinly;
+edges blur with the length of the ray; the sky's grey comes in through the
+same window and falls away into the corners; and what the sun lights lights
+the rest of the room in turn, in its own colour, white at noon and red at
+sunset. Cloud softens the panes and then puts them out, leaving the grey
+light of the window itself; fog does the same. At night the moon throws its
+own, faintly, by its phase. One liberty is taken: light from far round to the
+side is turned back toward the room, or a summer sunrise, which comes from
+behind the window's wall, would not come in at all. The theme tints the light
+and sets the room: under a dark theme the room at night is its background,
+under a light one the wall in full sun is.
+floor in full sun is.
+
+`slitscan` is the whole day in one picture, the way a slit-scan camera makes
+one: every column of the screen is the sky at a different moment. Now is the
+middle column, the twelve hours gone run out to the left edge and the twelve
+to come to the right, so the night is as wide as the night is long and each
+twilight is a seam between them. The picture slides left as the day goes.
+Each column is the `sky` style's clear sky for its moment, in the theme's
+colours. It does not use the weather.
+
 ```sh
-skybg config style bokashi     # or cyanotype
+skybg config style bokashi     # or cyanotype, gradient, window, slitscan
 skybg preview
 skybg once
 ```
@@ -120,7 +160,7 @@ In automatic mode, `skybg` asks `linecast location` for coordinates and caches
 the result. It never guesses a location. Without linecast or an explicit
 location, it stops with setup instructions.
 
-Weather mode sends latitude and longitude to the
+Weather mode (the `sky` and `window` styles) sends latitude and longitude to the
 [Open-Meteo forecast API](https://open-meteo.com/) to request current cloud
 cover and weather code. Results are cached for 20 minutes. If the request
 fails, `skybg` uses the last result, then a mild 30% cloud fallback. Disable
